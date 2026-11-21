@@ -1,22 +1,17 @@
-# lan-chat (Phase 3)
+# mesh-chat
 
-A serverless, peer-to-peer LAN chat written in Rust. Peers discover each other with **mDNS**,
-exchange usernames and messages over **libp2p** (Noise-encrypted direct request/response), and use
-gossipsub only to broadcast presence. No central server is involved.
+A serverless, peer-to-peer chat for the terminal. Peers find each other on the local network with **mDNS**, exchange usernames and messages over direct **Noise-encrypted libp2p** connections, and use gossipsub only for presence. There is no central server and no account to create.
 
-Phase 2 added a full-screen ratatui UI, multiline input, `/users` autofill, private invite-only
-groups, and `(Pending)` delivery state. Phase 3 adds a local SQLite outbox: messages to offline
-peers stay Pending, survive restarts, and are flushed with exponential backoff when those peers come
-back online. The TUI contract is unchanged. The phase 1 line-by-line CLI remains available as
-`--simple` (it does not use the outbox).
+History, group memberships and undelivered messages are kept in a local SQLite database, so messages to offline peers stay pending, survive restarts, and are retried with exponential backoff when those peers come back online.
 
-## Requirements
+> **Current scope:** peers must be on the same local network. mDNS uses multicast UDP 5353 and requires a shared L2 broadcast domain; VPNs, Docker bridge networks and Wi-Fi client isolation usually block it. Connecting to peers outside the local network is not implemented yet.
+
+## Running it
+
+Requirements:
 
 - Rust 1.88+ (developed with 1.97).
-- All peers must be on the **same local network**. mDNS uses multicast UDP port 5353; VPNs, Docker
-  bridge networks, and WiFi client isolation usually block it.
-
-## Quick start
+- All peers on the same local network, with UDP 5353 multicast available.
 
 ```sh
 make build   # cargo build
@@ -24,18 +19,17 @@ make test    # cargo test --all-targets
 make run     # cargo run (full-screen TUI)
 ```
 
-You will be asked for a username, then the full-screen UI opens. A minimal terminal can be enough,
-but a real terminal is recommended because the UI uses alternate screen and raw mode.
+You will be asked for a username, then the full-screen UI opens. A real terminal is recommended because the UI uses the alternate screen and raw mode.
+
+For a plain line-by-line terminal instead:
 
 ```sh
-make run ARGS="--simple"   # plain line-by-line CLI (phase 1 fallback)
+make run ARGS="--simple"
 ```
 
-### Testing two instances on one laptop
+### Two instances on one laptop
 
-Both terminals must use **different data directories**. If you just run `make run` twice in the same
-folder, both processes load the same `data/identity.key` and therefore have the same PeerId; the app
-ignores its own PeerId, so you will see no peers. Give each instance its own directory:
+Both processes need **different data directories**. Otherwise they load the same `data/identity.key`, share a PeerId, and ignore each other as "self".
 
 ```sh
 # Terminal 1
@@ -45,67 +39,13 @@ make run ARGS="--data-dir data/alice"
 make run ARGS="--data-dir data/bob"
 ```
 
-(Equivalent: `cargo run -- --data-dir data/alice`.) Each directory gets its own `identity.key`,
-`chat.db` and `chat.log`. Both instances should discover each other within a few seconds; type
-`/users` to see the known peers. On two different laptops, the default `make run` is enough.
+Each directory gets its own `identity.key`, `chat.db` and `chat.log`. Peers should discover each other within a few seconds; type `/users` to see them. On two different laptops the default `make run` is enough.
 
-## Architecture
+### Using the TUI
 
-```mermaid
-flowchart LR
-  Main["main.rs"] --> UI["ui/ TUI"]
-  Main --> Net["network/ swarm"]
-  Main --> Store["worker.rs Store"]
-
-  UI -->|"send / group command"| Store
-  Store -->|"oneshot reply: history, Pending"| UI
-  Store --> Worker["DB worker"]
-  Worker --> DB[("chat.db")]
-  Worker -->|"due outbox rows"| Net
-  Net -->|"NetworkEvent"| UI
-  Net -->|"ACK, presence, message, group events"| Worker
-
-  Net -->|"mDNS discovery + Noise request/response + gossipsub presence"| Peers["Other LAN peers"]
-  Peers -->|"same protocols"| Net
-```
-
-`main.rs` wires the three owners together: the TUI draws state, the worker is the only owner of
-SQLite, and `network/` owns the swarm. Every network event is mirrored to the worker and the UI, so
-presence can flush the outbox while the same event updates the chat panel.
-
-## TUI layout and keys
-
-```
-┌──────────────┬───────────────────────────────────────────┐
-│ CHANNELS     │  #general | DM alice·12ab | 🔒 team       │
-│ #general     ├───────────────────────────────────────────┤
-│ DM alice·12ab│ [10:42] alice·12ab: hey                   │
-│              │ [10:43]                       me: hi      │
-│              │ [10:44] alice·12ab: multi-line            │
-│              │                   message                 │
-│ GROUPS       ├───────────────────────────────────────────┤
-│ 🔒 team      │  Message (Shift+Enter = newline)          │
-└──────────────┴───────────────────────────────────────────┘
-```
-
-- `Enter` sends the current input. `Shift+Enter` inserts a newline.
-- `↑`/`↓` select a channel or group in the left panel.
-- `Enter` or `Tab` switches to the highlighted channel/group; `Esc` returns focus to the input.
-  Typing any character also returns focus to the input, so the next `Enter` sends your message.
-- `/quit`, `/exit`, or `Ctrl+C` exits and always restores the terminal.
-- There is no USERS panel: `/users` prints the known peers into the chat panel. DMs appear directly
-  in CHANNELS as `DM name·suffix` as soon as a peer connects (presence/connection event), before any
-  message is exchanged.
-
-Because usernames are only labels, every peer is shown as `name·<last4 of PeerId>` (PeerIds all start
-with `12D3`, so the suffix is the distinguishing part). Names are resolved by prefix in commands.
-Connected peers are shown in **green** in their DM channel label, and their broadcast/DM messages
-are green too; offline or unknown senders are gray. Any incoming message (including a `#general`
-broadcast) registers the sender as online, so a just-connected peer appears green immediately.
-Messages from an unknown sender create the canonical `dm:<peer-id>` thread and learn that user's
-name from the message, rather than opening an extra "unknown" channel.
-
-## Commands
+- `Enter` sends the current input; `Shift+Enter` inserts a newline.
+- `↑`/`↓` select a channel or group; `Enter` or `Tab` switches to it; `Esc` returns focus to the input. Typing any character also returns focus to the input.
+- `/quit`, `/exit` or `Ctrl+C` exits and restores the terminal.
 
 | Command | Effect |
 | --- | --- |
@@ -114,58 +54,77 @@ name from the message, rather than opening an extra "unknown" channel.
 | `/group create <name>` | Create a private group; only you see it at first |
 | `/group add <group> <name>` | Invite a user; any member can invite more users |
 | `/group members <group>` | List current members of a group |
-| `/quit` | Exit the TUI |
-| `/help` or unknown `/…` | Show short command help |
+| `/help` | Show short command help |
 
-Plain text sends to the active conversation: `#general` (everyone online), a `dm:<peer_id>` thread,
-or a private group (one encrypted direct message per member). Every chat line shows its local
-`HH:MM` timestamp. A send to an offline recipient stays marked `(Pending)` in the UI and is stored
-in `chat.db`. When that peer returns, the outbox worker
-retries the send; the marker disappears once every recipient has acknowledged it. Failed attempts
-retry at 1 s, 2 s, 4 s … capped at 5 minutes; nothing is dropped.
+Plain text goes to the active conversation: `#general` (everyone online), a direct-message thread, or a private group. Every chat line has a local `HH:MM` timestamp. A send to an offline recipient shows `(Pending)` until it is acknowledged; retries run at 1 s, 2 s, 4 s … capped at 5 minutes, and nothing is dropped.
 
-## Private groups
+Usernames are labels, so each peer is shown as `name·<last4 of PeerId>`. Connected peers and their messages are green, offline or unknown senders are gray, and your own messages are green.
 
-- Groups are invite-only and **invisible until invited**. Creating a group contacts nobody.
-- When B invites C, C receives a `GroupInvite`; all existing members receive `MemberAdded`, so member
-  lists converge and chain invites work (B can invite C, then C can invite D).
-- New members get **no history backfill**. There is no leave/remove command in v1.
-- Group messages are one direct libp2p request per member carrying the group UUID; there is no
-  gossipsub group topic, so non-members never see the group name.
-- Privacy caveat: names, membership and messages travel as Noise-encrypted direct traffic between
-  peers, but there is **no separate group encryption key** in v1. A malicious peer sniffing the LAN
-  can still observe traffic metadata. Do not treat groups as a secure channel against local sniffing.
-
-## Files created at runtime
+### Files created at runtime
 
 With the default `--data-dir data`:
 
-- `data/identity.key` — ed25519 private key (mode `0600` on Unix). The PeerId stays the same across
-  restarts. Delete this file to get a new identity.
-- `data/chat.db` — SQLite database (WAL mode) holding peers, messages, group memberships and outbox
-  rows. History and Pending state survive restarts. Presence and in-flight delivery flags are reset
-  on startup because they describe the current process, not saved history.
-- `data/chat.log` — tracing output. Logs go to a file so the terminal stays clean, including in TUI
-  mode. Set `RUST_LOG=debug` for verbose diagnostics.
+- `data/identity.key` — ed25519 private key (mode `0600` on Unix). The PeerId stays the same across restarts; delete the file to get a new identity.
+- `data/chat.db` — SQLite database (WAL mode) holding peers, messages, group memberships and outbox rows.
+- `data/chat.log` — tracing output. Logs go to a file so the terminal stays clean. Set `RUST_LOG=debug` for verbose diagnostics.
 
-## Layout
+## Architecture
 
-- `src/main.rs` — identity loading, logging and wiring between network, database worker and UI;
-  `--simple` selects the fallback CLI.
-- `src/network/` — swarm behaviour, mDNS/discovery events, wire protocol, group events and ACK
-  correlation by libp2p request id or phase 3 outbox id.
-- `src/database/` — SQLite schema and the only connection to `chat.db`, owned by the worker.
+```mermaid
+flowchart LR
+  Main["main.rs (wiring)"] --> UI["TUI / simple CLI"]
+  Main --> Net["network/ — libp2p swarm"]
+  Main --> Worker["worker — SQLite owner"]
+
+  UI -->|"send, group commands"| Worker
+  Worker -->|"history, Pending state"| UI
+  Worker -->|"due outbox rows"| Net
+  Net -->|"ACKs, presence, messages, group events"| Worker
+  Net -->|"events"| UI
+
+  Net -->|"mDNS discovery + Noise direct request/response + gossipsub presence"| Peers["Other LAN peers"]
+  Peers -->|"same protocols"| Net
+
+  Worker --> DB[("chat.db")]
+```
+
+`main.rs` wires three independent owners: the UI draws state, the worker is the only owner of the SQLite connection, and `network/` owns the swarm. The network task handles mDNS discovery, direct encrypted request/response for messages, invites and acknowledgements, and gossipsub only for presence. Every network event is mirrored to the worker and the UI, so presence can flush the outbox while the same event updates the chat panel.
+
+The outbox stores one row per (message, recipient), so group fan-out is acknowledged individually. Rows are only dequeued for peers currently online; delivery reports mark them done or apply backoff. This is what lets offline messages survive restarts.
+
+### Folder structure
+
+- `src/main.rs` — CLI arguments, identity loading, logging and wiring between the UI, network and database worker.
+- `src/network/`
+  - `mod.rs` — swarm task, network commands/events, peer map and direct sends with ACK correlation.
+  - `behaviour.rs` — mDNS, identify, request-response and gossipsub composition.
+  - `events.rs` — swarm and behaviour events mapped to app-level network events.
+  - `protocol.rs` — wire types for chat, presence, group invites and ACKs.
+- `src/database/`
+  - `mod.rs` — SQLite schema setup and the only connection to `chat.db`, owned by the worker.
+  - `migration/0001_schema.sql` — table and index definitions.
 - `src/worker.rs` — `Store` request/reply API, outbox poll loop, retry backoff and event mirroring.
-- `src/ui/cli.rs` — phase 1 plain terminal prompt (`--simple`), kept as a fallback.
-- `src/ui/app.rs` — phase 2/3 state: peers, groups, conversations, pending ack map, stable colors,
-  history restoration and RAII terminal guard.
-- `src/ui/input.rs` — phase 2 key handling, `/users` autofill, command parser and channel navigation.
-- `src/ui/render.rs` — phase 2 ratatui layout and tests using `TestBackend`.
+- `src/ui/`
+  - `mod.rs` — UI event loop, action dispatch and routing of network/worker events into app state.
+  - `cli.rs` — plain line-by-line prompt (`--simple`), kept as a fallback.
+  - `app.rs` — state: peers, groups, conversations, pending ack map, stable colors, history restoration and RAII terminal guard.
+  - `input.rs` — key handling, command parser and channel navigation.
+  - `render.rs` — ratatui layout and tests using `TestBackend`.
+- `Cargo.toml` — crate metadata and dependencies; `Makefile` — `build`, `run`, `test` and convenience targets.
 
-Every module carries its own unit tests (`make test`). Real multi-peer behaviour is checked manually
-with two or more terminals, as described above.
+## What is implemented
 
-## Roadmap
+- mDNS peer discovery with stable PeerIds persisted in an identity file.
+- Noise-encrypted direct messages, one-to-one and `#general` broadcasts, with delivery acknowledgements.
+- Full-screen terminal UI with multiline input, channels, direct messages, stable per-peer colors and `(Pending)` state; a plain `--simple` CLI is also available.
+- Private invite-only groups with chain invites: any member can invite more members, and member lists converge across all existing members. Non-members never see group names or messages.
+- Local SQLite persistence: history, peers, group memberships and an outbox with exponential-backoff retries and offline flushing on reconnect.
+- Unit tests across all modules (`make test`).
 
-All three planned phases are complete. Possible follow-ups: group encryption keys, leave/remove
-commands, manual `/connect <multiaddr>` for restricted networks, and message search/pagination.
+## What is missing
+
+- **Connections beyond the local network.** No WebRTC-style NAT traversal, manual `/connect <multiaddr>`, DHT discovery or relay support yet.
+- **Group encryption keys.** Messages are Noise-encrypted between peers, but there is no separate group key; metadata such as membership and traffic patterns is visible to a peer sniffing the LAN. Groups are not a secure channel against local sniffing.
+- **Group management.** No leave/remove commands, and new members get no history backfill.
+- **Message search and pagination.** The TUI shows a bounded recent window (1000 lines per conversation); older history lives in SQLite but cannot be browsed yet.
+- **Automated multi-process integration tests.** Multi-peer behavior is currently verified manually with the two-instance setup above.

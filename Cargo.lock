@@ -1680,27 +1680,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lan-chat"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "futures",
- "indexmap",
- "libp2p",
- "ratatui",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tui-textarea",
- "uuid",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2164,6 +2143,27 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mesh-chat"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "futures",
+ "indexmap",
+ "libp2p",
+ "ratatui",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tui-textarea",
+ "uuid",
+]
 
 [[package]]
 name = "minimal-lexical"

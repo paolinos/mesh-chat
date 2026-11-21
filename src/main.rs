@@ -74,7 +74,7 @@ where
 }
 
 fn print_usage() {
-    println!("Usage: lan-chat [--data-dir DIR] [--simple]");
+    println!("Usage: mesh-chat [--data-dir DIR] [--simple]");
     println!();
     println!("  --data-dir DIR  where identity.key and chat.db live; default: data");
     println!("  --simple        plain line-by-line CLI instead of the full-screen TUI");
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn parses_data_dir_argument() {
         assert_eq!(
-            parse_args_from(["lan-chat".to_string()]),
+            parse_args_from(["mesh-chat".to_string()]),
             Cli::Run {
                 data_dir: PathBuf::from(DATA_DIR),
                 simple: false,
@@ -219,7 +219,7 @@ mod tests {
         );
         assert_eq!(
             parse_args_from([
-                "lan-chat".to_string(),
+                "mesh-chat".to_string(),
                 "--data-dir".to_string(),
                 "data/alice".to_string(),
                 "--simple".to_string(),
@@ -230,11 +230,11 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args_from(["lan-chat".to_string(), "--help".to_string()]),
+            parse_args_from(["mesh-chat".to_string(), "--help".to_string()]),
             Cli::Help
         );
         assert!(matches!(
-            parse_args_from(["lan-chat".to_string(), "--data-dir".to_string()]),
+            parse_args_from(["mesh-chat".to_string(), "--data-dir".to_string()]),
             Cli::Error(_)
         ));
     }
