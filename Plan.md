@@ -9,8 +9,8 @@ messages to offline peers wait until those peers come back.
 The project is built incrementally in **3 phases**. Each phase leaves the app working; phase 2
 replaces the plain CLI with a TUI, phase 3 adds persistence without changing the UI contract.
 
-**Status:** Phases 1 and 2 are implemented and verified (`make test`: 42 passing tests); phase 3 is
-pending. The phase 1 UI is still available as `--simple`.
+**Status:** Phases 1, 2 and 3 are implemented and verified (`make test`: 58 passing tests). The
+phase 1 UI is still available as `--simple`; the outbox/persistence path is used by the TUI.
 
 ---
 
@@ -118,7 +118,7 @@ tempfile = "3"          # isolated DB / identity files in tests
                     │ mdns, gossipsub, │
                     │ request-response │
                     └───────▲──────────┘
-                            │ SendDirect { outbox_id, recipient, payload }
+                            │ SendDirect { request, recipients: vec![recipient] }
                     ┌───────┴──────────┐
                     │ worker/          │◄── WorkerCommand
                     │ outbox poller    │    (SaveOutgoing, DeliveryReport,
@@ -159,7 +159,8 @@ src/
     render.rs              # phase 2: ratatui layout, per-user colors, Pending marker
   database/
     mod.rs                 # Db wrapper, open + migrate
-    schema.sql             # tables + indexes
+    migration/
+      0001_schema.sql      # tables + indexes
     models.rs              # Message, OutboxRow, PeerRow, GroupRow
     queries.rs             # prepared statements
   worker/
@@ -368,11 +369,16 @@ struct Presence { peer_id: String, username: String, online: bool }
 
 ## Phase 3 — Local SQLite database and outbox worker
 
+**Status:** implemented and verified. `data/chat.db` is owned by one blocking worker; the UI talks
+to it through `Store` and receives `WorkerEvent::PendingChanged` / `DeliveryFailed` notifications.
+Presence and in-flight flags are reset at startup, so a restart never claims rows for stale peers.
+
 ### Tasks
 
 1. Add `rusqlite` bundled; `database/mod.rs` opens `data/chat.db`, sets
-   `PRAGMA journal_mode = WAL; foreign_keys = ON;`, and runs `schema.sql` at startup.
-2. **Schema** (initial draft):
+   `PRAGMA journal_mode = WAL; foreign_keys = ON;`, and runs
+   `migration/0001_schema.sql` at startup.
+2. **Schema** (implemented):
 
    ```sql
    CREATE TABLE peers (
@@ -436,7 +442,7 @@ struct Presence { peer_id: String, username: String, online: bool }
       one `member_added` outbox row per existing member.
    3. Worker poll loop (~500 ms, `recv_timeout`): select `state='pending' AND next_attempt_at <= now`
       **joined with `peers.online = 1`** (offline rows are never dequeued), flip to `in_flight`, send
-      `NetworkCommand::SendDirect { outbox_id, recipient, payload }`.
+      `NetworkCommand::SendDirect { request, recipients: vec![recipient] }`.
    4. Network replies `NetworkEvent::DeliveryReport { outbox_id, ok, error }`; `main.rs` forwards it
       to the worker.
    5. Worker sets `state='done'` on ack; on failure increments `attempts` and applies exponential
@@ -450,8 +456,9 @@ struct Presence { peer_id: String, username: String, online: bool }
    via `INSERT OR IGNORE` on the UUID, then rendered. Invite/member events update `groups` /
    `group_members` and are also stored (as outbox rows on the sender side, as applied events on the
    receiver side — add an `events` table if audit of received group events is desired; optional).
-5. Worker is a blocking thread (`spawn_blocking` + `tokio::sync::mpsc::Receiver::blocking_recv` with
-   `recv_timeout`) so SQLite never blocks the async runtime. UI never opens a second connection.
+5. Worker is a blocking thread (`spawn_blocking` + `std::sync::mpsc::Receiver::recv_timeout`) so
+   SQLite never blocks the async runtime. It uses `blocking_send` for network commands; the UI never
+   opens a second connection.
 6. UI derives `(Pending)` from `SELECT count(*) FROM outbox WHERE message_id = ? AND state <> 'done'`
    via the worker (cached in `App` and updated on `DeliveryReport`).
 7. `README.md`: `data/chat.db`, retry/backoff policy, "offline = pending, connect = flush".
@@ -468,6 +475,10 @@ struct Presence { peer_id: String, username: String, online: bool }
 - Unit tests cover every phase-3 module (`database/`, `worker/`, plus updated `ui/` and `main.rs`
   routing): migration, outbox claim/ack/failure/backoff, offline filtering, group fan-out rows,
   dedupe, identity load/create; `make test` passes.
+
+Verified with `make test` (58 tests), `make build`, `cargo check --all-targets`, and multi-process
+PTY smoke tests for chat/ACK, presence-only DMs, group fanout/chain invites, offline queueing, and
+pending rows surviving a restart.
 
 ---
 

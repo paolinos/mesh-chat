@@ -9,15 +9,18 @@ use crossterm::event::{poll, read, Event};
 use libp2p::PeerId;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::network::{
-    protocol::ChatRequest,
-    NetworkCommand, NetworkEvent,
+use crate::{
+    network::{NetworkCommand, NetworkEvent},
+    worker::{Store, WorkerEvent},
 };
 
 use app::{make_message, App, GENERAL};
 use input::{Action, InputResult};
 
-fn handle_network_event(app: &mut App, event: NetworkEvent) {
+fn handle_network_event(app: &mut App, event: NetworkEvent, store: Option<&Store>) {
+    if let Some(store) = store {
+        store.observe_network_event(&event);
+    }
     match event {
         NetworkEvent::PeerConnected { peer_id, username }
         | NetworkEvent::Presence {
@@ -79,11 +82,8 @@ fn handle_network_event(app: &mut App, event: NetworkEvent) {
 /// Who receives a message in the active conversation.
 pub fn recipients_for(app: &App, channel: &str) -> Vec<PeerId> {
     let mut recipients: Vec<PeerId> = if channel == GENERAL {
-        app.peers
-            .iter()
-            .filter(|(_, peer)| peer.online)
-            .map(|(peer_id, _)| *peer_id)
-            .collect()
+        // Keep offline peers too: phase 3 stores their rows in the outbox and flushes on reconnect.
+        app.peers.keys().copied().collect()
     } else if let Some(value) = channel.strip_prefix("dm:") {
         match value.parse::<PeerId>() {
             Ok(peer_id) => vec![peer_id],
@@ -112,20 +112,19 @@ async fn send_message(
     channel: String,
     body: String,
     recipients: Vec<PeerId>,
-    cmd_tx: &Sender<NetworkCommand>,
+    store: &Store,
 ) {
     if recipients.is_empty() {
         app.system("No one to send to yet — wait for a peer to come online.");
         return;
     }
     let message = make_message(&me, username, channel, body);
+    let message_id = message.id.clone();
     app.record_outgoing(message.clone(), recipients.clone());
-    let _ = cmd_tx
-        .send(NetworkCommand::SendDirect {
-            request: ChatRequest::Chat(message),
-            recipients,
-        })
-        .await;
+    if let Err(error) = store.save_outgoing(message, recipients).await {
+        app.set_message_pending(&message_id, false);
+        app.system(format!("! message was not saved: {error}"));
+    }
 }
 
 pub async fn handle_action(
@@ -133,19 +132,19 @@ pub async fn handle_action(
     me: PeerId,
     username: &str,
     action: Action,
-    cmd_tx: &Sender<NetworkCommand>,
+    store: &Store,
 ) {
     match action {
         Action::SendChat(body) => {
             let channel = app.active_conversation.clone();
             let recipients = recipients_for(app, &channel);
-            send_message(app, me, username, channel, body, recipients, cmd_tx).await;
+            send_message(app, me, username, channel, body, recipients, store).await;
         }
         Action::SendDm { user, body } => match app.resolve_user(&user) {
             Ok(peer_id) => {
                 let channel = format!("dm:{peer_id}");
                 app.activate_conversation(&channel);
-                send_message(app, me, username, channel, body, vec![peer_id], cmd_tx).await;
+                send_message(app, me, username, channel, body, vec![peer_id], store).await;
             }
             Err(error) => app.system(error.to_string()),
         },
@@ -155,6 +154,9 @@ pub async fn handle_action(
         }
         Action::GroupCreate(name) => {
             let id = app.create_group(&name);
+            if let Err(error) = store.create_group(id.clone(), name.clone()).await {
+                app.system(format!("! group was not saved: {error}"));
+            }
             app.activate_conversation(&id);
             app.system(format!(
                 "Created private group '{name}'. Invite with /group add <group> <user>."
@@ -168,7 +170,9 @@ pub async fn handle_action(
                     return;
                 }
             };
-            if !app.is_group_member(&app.groups[index].id) {
+            let group_id = app.groups[index].id.clone();
+            let group_name = app.groups[index].name.clone();
+            if !app.is_group_member(&group_id) {
                 app.system("You are not a member of that group.");
                 return;
             }
@@ -183,43 +187,32 @@ pub async fn handle_action(
                 app.system("You are already in the group.");
                 return;
             }
-            let group_id = app.groups[index].id.clone();
-            let group_name = app.groups[index].name.clone();
+            if app.groups[index].members.contains(&invitee) {
+                app.system(format!("{} is already in '{group_name}'.", app.peer_label(&invitee)));
+                return;
+            }
             let existing: Vec<PeerId> = app.groups[index]
                 .members
                 .iter()
                 .copied()
                 .filter(|peer| *peer != me)
                 .collect();
-            app.add_group_member(&group_id, invitee);
-            app.system(format!(
-                "➜ invited {} to '{group_name}'",
-                app.peer_label(&invitee)
-            ));
-
-            let _ = cmd_tx
-                .send(NetworkCommand::SendDirect {
-                    request: ChatRequest::GroupInvite {
-                        group_id: group_id.clone(),
-                        group_name: group_name.clone(),
-                        invited_by: me.to_string(),
-                    },
-                    recipients: vec![invitee],
-                })
-                .await;
-            if !existing.is_empty() {
-                let _ = cmd_tx
-                    .send(NetworkCommand::SendDirect {
-                        request: ChatRequest::MemberAdded {
-                            group_id,
-                            peer_id: invitee.to_string(),
-                            username: app.peer_label(&invitee),
-                            invited_by: me.to_string(),
-                        },
-                        recipients: existing,
-                    })
-                    .await;
+            let label = app.peer_label(&invitee);
+            if let Err(error) = store
+                .queue_group_invite(
+                    group_id.clone(),
+                    group_name.clone(),
+                    invitee,
+                    label.clone(),
+                    existing,
+                )
+                .await
+            {
+                app.system(format!("! invitation was not saved: {error}"));
+                return;
             }
+            app.add_group_member(&group_id, invitee);
+            app.system(format!("➜ invited {label} to '{group_name}'"));
         }
         Action::GroupMembers(group) => match app.resolve_group(&group) {
             Ok(index) => {
@@ -239,13 +232,26 @@ pub async fn handle_action(
     }
 }
 
+fn apply_worker_event(app: &mut App<'_>, event: WorkerEvent) {
+    match event {
+        WorkerEvent::PendingChanged {
+            message_id,
+            pending,
+        } => app.set_message_pending(&message_id, pending),
+        WorkerEvent::DeliveryFailed { error, .. } => {
+            app.system(format!("! delivery failed: {error} (still pending)"));
+        }
+    }
+}
+
 async fn tui_loop(
     terminal: &mut app::TerminalHandle,
     app: &mut App<'_>,
     me: PeerId,
     username: &str,
-    cmd_tx: &Sender<NetworkCommand>,
+    store: &Store,
     mut event_rx: Receiver<NetworkEvent>,
+    mut worker_events: tokio::sync::mpsc::UnboundedReceiver<WorkerEvent>,
 ) -> Result<(), Box<dyn Error>> {
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     loop {
@@ -253,17 +259,20 @@ async fn tui_loop(
 
         tokio::select! {
             event = event_rx.recv() => match event {
-                Some(event) => handle_network_event(app, event),
+                Some(event) => handle_network_event(app, event, Some(store)),
                 None => return Ok(()),
             },
             _ = tick.tick() => {
+                while let Ok(event) = worker_events.try_recv() {
+                    apply_worker_event(app, event);
+                }
                 while poll(Duration::ZERO)? {
                     if let Event::Key(key) = read()? {
                         match input::handle_key(app, key) {
                             InputResult::Quit => return Ok(()),
                             InputResult::Redraw => {}
                             InputResult::Action(action) => {
-                                handle_action(app, me, username, action, cmd_tx).await;
+                                handle_action(app, me, username, action, store).await;
                             }
                         }
                     }
@@ -279,11 +288,17 @@ pub async fn run(
     username: String,
     cmd_tx: Sender<NetworkCommand>,
     event_rx: Receiver<NetworkEvent>,
+    store: Store,
+    worker_events: tokio::sync::mpsc::UnboundedReceiver<WorkerEvent>,
 ) -> Result<(), Box<dyn Error>> {
     // Created first so every later error path still restores the terminal.
     let _guard = app::TerminalGuard::new()?;
     let mut terminal = app::terminal()?;
     let mut app = App::new(me, username.clone());
+    match store.load_history().await {
+        Ok(history) => app.apply_history(history),
+        Err(error) => app.system(format!("! could not load saved history: {error}")),
+    }
     app.system("Welcome! /help lists commands. mDNS discovery may take a few seconds.");
 
     let result = tui_loop(
@@ -291,8 +306,9 @@ pub async fn run(
         &mut app,
         me,
         &username,
-        &cmd_tx,
+        &store,
         event_rx,
+        worker_events,
     )
     .await;
     let _ = cmd_tx.send(NetworkCommand::Shutdown).await;
@@ -321,6 +337,7 @@ mod tests {
             channel: channel.to_string(),
             body: "hello".to_string(),
             created_at: 1,
+            outbox_id: None,
         }
     }
 
@@ -335,6 +352,7 @@ mod tests {
                 username: "carol".to_string(),
                 online: true,
             },
+            None,
         );
         assert!(app.peers[&peer].online);
         handle_network_event(
@@ -342,6 +360,7 @@ mod tests {
             NetworkEvent::MessageReceived {
                 message: message(GENERAL),
             },
+            None,
         );
         assert_eq!(app.conversations[GENERAL].len(), 1);
         handle_network_event(
@@ -352,6 +371,7 @@ mod tests {
                 ok: true,
                 error: None,
             },
+            None,
         );
         assert!(!app.is_pending("m1"));
     }
@@ -370,6 +390,7 @@ mod tests {
                 ok: false,
                 error: Some("offline".to_string()),
             },
+            None,
         );
         assert!(app.is_pending("m1"));
     }
@@ -379,7 +400,8 @@ mod tests {
         let mut app = fixture();
         let bob = *app.peers.keys().next().unwrap();
         app.add_or_update_peer(bob, "bob", false);
-        assert!(recipients_for(&app, GENERAL).is_empty());
+        // Offline peers stay in the outbox instead of being dropped.
+        assert_eq!(recipients_for(&app, GENERAL), vec![bob]);
 
         app.set_peer_online(bob, true);
         assert_eq!(recipients_for(&app, GENERAL), vec![bob]);

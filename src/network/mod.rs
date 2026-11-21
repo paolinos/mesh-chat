@@ -101,6 +101,14 @@ pub enum NetworkEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingRequest {
+    /// Phase-3 requests carry their outbox id in the wire payload and ACK.
+    Outbox { outbox_id: u64 },
+    /// Phase-1/2 fallback: correlate by message id until the peer learns phase 3.
+    Legacy { message_id: String, peer: PeerId },
+}
+
 pub struct NetworkHandle {
     pub peer_id: PeerId,
     pub task: JoinHandle<()>,
@@ -154,8 +162,8 @@ async fn run_loop(
     let mut connected = HashSet::new();
     let mut announced = HashSet::new();
     let mut known_usernames: HashMap<PeerId, String> = HashMap::new();
-    // Outbound request id -> (message id, recipient), used to clear `(Pending)`.
-    let mut pending_requests: HashMap<OutboundRequestId, (String, PeerId)> = HashMap::new();
+    // Outbound request id -> correlation data for ACKs and delivery reports.
+    let mut pending_requests: HashMap<OutboundRequestId, PendingRequest> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -265,13 +273,15 @@ async fn run_loop(
                                 );
                             }
                             ChatRequest::Chat(message) => {
+                                let outbox_id = message.outbox_id;
+                                let message = ChatMessage { outbox_id: None, ..message };
                                 let _ = event_tx.send(NetworkEvent::MessageReceived { message }).await;
                                 let _ = swarm.behaviour_mut().request_response.send_response(
                                     channel,
-                                    ChatResponse::Ack { outbox_id: None, ok: true, error: None },
+                                    ChatResponse::Ack { outbox_id, ok: true, error: None },
                                 );
                             }
-                            ChatRequest::GroupInvite { group_id, group_name, invited_by } => {
+                            ChatRequest::GroupInvite { group_id, group_name, invited_by, outbox_id } => {
                                 let _ = event_tx.send(NetworkEvent::GroupInviteReceived {
                                     from: peer,
                                     group_id,
@@ -280,10 +290,10 @@ async fn run_loop(
                                 }).await;
                                 let _ = swarm.behaviour_mut().request_response.send_response(
                                     channel,
-                                    ChatResponse::Ack { outbox_id: None, ok: true, error: None },
+                                    ChatResponse::Ack { outbox_id, ok: true, error: None },
                                 );
                             }
-                            ChatRequest::MemberAdded { group_id, peer_id, username, invited_by } => {
+                            ChatRequest::MemberAdded { group_id, peer_id, username, invited_by, outbox_id } => {
                                 match peer_id.parse::<PeerId>() {
                                     Ok(added) => {
                                         let _ = event_tx.send(NetworkEvent::MemberAddedReceived {
@@ -298,7 +308,7 @@ async fn run_loop(
                                 }
                                 let _ = swarm.behaviour_mut().request_response.send_response(
                                     channel,
-                                    ChatResponse::Ack { outbox_id: None, ok: true, error: None },
+                                    ChatResponse::Ack { outbox_id, ok: true, error: None },
                                 );
                             }
                         },
@@ -321,14 +331,26 @@ async fn run_loop(
                                 }).await;
                             }
                             ChatResponse::Ack { outbox_id: None, ok, error } => {
-                                if let Some((message_id, peer_id)) = pending_requests.remove(&request_id) {
-                                    debug!(%message_id, peer = %short_peer_id(&peer_id), ok, "chat ack");
-                                    let _ = event_tx.send(NetworkEvent::MessageAck {
-                                        message_id,
-                                        peer_id,
-                                        ok,
-                                        error,
-                                    }).await;
+                                // A phase-2 peer omits `outbox_id`. We still know which tracked
+                                // send this reply belongs to, so keep the row pending/done correctly.
+                                match pending_requests.remove(&request_id) {
+                                    Some(PendingRequest::Outbox { outbox_id }) => {
+                                        let _ = event_tx.send(NetworkEvent::DeliveryReport {
+                                            outbox_id,
+                                            ok,
+                                            error,
+                                        }).await;
+                                    }
+                                    Some(PendingRequest::Legacy { message_id, peer }) => {
+                                        debug!(%message_id, peer = %short_peer_id(&peer), ok, "chat ack");
+                                        let _ = event_tx.send(NetworkEvent::MessageAck {
+                                            message_id,
+                                            peer_id: peer,
+                                            ok,
+                                            error,
+                                        }).await;
+                                    }
+                                    None => {}
                                 }
                             }
                         },
@@ -336,13 +358,23 @@ async fn run_loop(
                     SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(
                         request_response::Event::OutboundFailure { peer, request_id, error, .. },
                     )) => {
-                        if let Some((message_id, peer_id)) = pending_requests.remove(&request_id) {
-                            let _ = event_tx.send(NetworkEvent::MessageAck {
-                                message_id,
-                                peer_id,
-                                ok: false,
-                                error: Some(error.to_string()),
-                            }).await;
+                        match pending_requests.remove(&request_id) {
+                            Some(PendingRequest::Outbox { outbox_id, .. }) => {
+                                let _ = event_tx.send(NetworkEvent::DeliveryReport {
+                                    outbox_id,
+                                    ok: false,
+                                    error: Some(error.to_string()),
+                                }).await;
+                            }
+                            Some(PendingRequest::Legacy { message_id, peer }) => {
+                                let _ = event_tx.send(NetworkEvent::MessageAck {
+                                    message_id,
+                                    peer_id: peer,
+                                    ok: false,
+                                    error: Some(error.to_string()),
+                                }).await;
+                            }
+                            None => {}
                         }
                         let _ = event_tx.send(NetworkEvent::Error {
                             message: format!("request to {} failed: {error}", short_peer_id(&peer)),
@@ -405,23 +437,40 @@ async fn run_loop(
     debug!("network task stopped");
 }
 
-/// Send one request and remember chat requests so their ACK can clear `(Pending)`.
+/// Decide how an outbound request's ACK will be correlated.
+fn pending_for_request(request: &ChatRequest, peer: PeerId) -> Option<PendingRequest> {
+    match request {
+        ChatRequest::Chat(message) => Some(match message.outbox_id {
+            Some(outbox_id) => PendingRequest::Outbox { outbox_id },
+            None => PendingRequest::Legacy {
+                message_id: message.id.clone(),
+                peer,
+            },
+        }),
+        ChatRequest::GroupInvite { outbox_id: Some(outbox_id), .. }
+        | ChatRequest::MemberAdded { outbox_id: Some(outbox_id), .. } => {
+            Some(PendingRequest::Outbox {
+                outbox_id: *outbox_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Send one request and remember how to correlate its ACK.
 fn send_request(
     swarm: &mut Swarm<ChatBehaviour>,
-    pending_requests: &mut HashMap<OutboundRequestId, (String, PeerId)>,
+    pending_requests: &mut HashMap<OutboundRequestId, PendingRequest>,
     peer: PeerId,
     request: ChatRequest,
 ) {
-    let message_id = match &request {
-        ChatRequest::Chat(message) => Some(message.id.clone()),
-        _ => None,
-    };
+    let pending = pending_for_request(&request, peer);
     let request_id = swarm
         .behaviour_mut()
         .request_response
         .send_request(&peer, request);
-    if let Some(message_id) = message_id {
-        pending_requests.insert(request_id, (message_id, peer));
+    if let Some(pending) = pending {
+        pending_requests.insert(request_id, pending);
     }
 }
 
@@ -484,6 +533,7 @@ mod tests {
             channel: "#general".to_string(),
             body: "hi".to_string(),
             created_at: 1,
+            outbox_id: None,
         }
     }
 
@@ -542,6 +592,42 @@ mod tests {
             }
             _ => panic!("wrong event"),
         }
+    }
+
+    #[test]
+    fn outbox_requests_correlate_by_outbox_id() {
+        let peer = PeerId::random();
+        let tracked = ChatRequest::Chat(ChatMessage {
+            outbox_id: Some(42),
+            ..message()
+        });
+        assert_eq!(
+            pending_for_request(&tracked, peer),
+            Some(PendingRequest::Outbox { outbox_id: 42 })
+        );
+
+        let invite = ChatRequest::GroupInvite {
+            group_id: "g1".to_string(),
+            group_name: "team".to_string(),
+            invited_by: "me".to_string(),
+            outbox_id: Some(7),
+        };
+        assert_eq!(
+            pending_for_request(&invite, peer),
+            Some(PendingRequest::Outbox { outbox_id: 7 })
+        );
+    }
+
+    #[test]
+    fn legacy_chat_requests_correlate_by_message_id() {
+        let peer = PeerId::random();
+        assert_eq!(
+            pending_for_request(&ChatRequest::Chat(message()), peer),
+            Some(PendingRequest::Legacy {
+                message_id: "m-1".to_string(),
+                peer,
+            })
+        );
     }
 
     #[test]

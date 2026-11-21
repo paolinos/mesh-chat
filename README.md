@@ -1,12 +1,14 @@
-# lan-chat (Phase 2)
+# lan-chat (Phase 3)
 
 A serverless, peer-to-peer LAN chat written in Rust. Peers discover each other with **mDNS**,
 exchange usernames and messages over **libp2p** (Noise-encrypted direct request/response), and use
 gossipsub only to broadcast presence. No central server is involved.
 
-Phase 2 adds a full-screen ratatui UI, multiline input, `/users` autofill, private invite-only
-groups, and in-memory `(Pending)` delivery state. Phase 3 will add a local SQLite outbox so pending
-messages survive restarts and are retried when peers come back online.
+Phase 2 added a full-screen ratatui UI, multiline input, `/users` autofill, private invite-only
+groups, and `(Pending)` delivery state. Phase 3 adds a local SQLite outbox: messages to offline
+peers stay Pending, survive restarts, and are flushed with exponential backoff when those peers come
+back online. The TUI contract is unchanged. The phase 1 line-by-line CLI remains available as
+`--simple` (it does not use the outbox).
 
 ## Requirements
 
@@ -43,9 +45,9 @@ make run ARGS="--data-dir data/alice"
 make run ARGS="--data-dir data/bob"
 ```
 
-(Equivalent: `cargo run -- --data-dir data/alice`.) Each directory gets its own `identity.key` and
-`chat.log`. Both instances should discover each other within a few seconds; type `/users` to see the
-known peers. On two different laptops, the default `make run` is enough.
+(Equivalent: `cargo run -- --data-dir data/alice`.) Each directory gets its own `identity.key`,
+`chat.db` and `chat.log`. Both instances should discover each other within a few seconds; type
+`/users` to see the known peers. On two different laptops, the default `make run` is enough.
 
 ## TUI layout and keys
 
@@ -53,9 +55,9 @@ known peers. On two different laptops, the default `make run` is enough.
 ┌──────────────┬───────────────────────────────────────────┐
 │ CHANNELS     │  #general | DM alice·12ab | 🔒 team       │
 │ #general     ├───────────────────────────────────────────┤
-│ DM alice·12ab│  alice·12ab: hey                          │
-│              │                       me: hi              │
-│              │  alice·12ab: multi-line                   │
+│ DM alice·12ab│ [10:42] alice·12ab: hey                   │
+│              │ [10:43]                       me: hi      │
+│              │ [10:44] alice·12ab: multi-line            │
 │              │                   message                 │
 │ GROUPS       ├───────────────────────────────────────────┤
 │ 🔒 team      │  Message (Shift+Enter = newline)          │
@@ -65,6 +67,7 @@ known peers. On two different laptops, the default `make run` is enough.
 - `Enter` sends the current input. `Shift+Enter` inserts a newline.
 - `↑`/`↓` select a channel or group in the left panel.
 - `Enter` or `Tab` switches to the highlighted channel/group; `Esc` returns focus to the input.
+  Typing any character also returns focus to the input, so the next `Enter` sends your message.
 - `/quit`, `/exit`, or `Ctrl+C` exits and always restores the terminal.
 - There is no USERS panel: `/users` prints the known peers into the chat panel. DMs appear directly
   in CHANNELS as `DM name·suffix` as soon as a peer connects (presence/connection event), before any
@@ -91,8 +94,11 @@ name from the message, rather than opening an extra "unknown" channel.
 | `/help` or unknown `/…` | Show short command help |
 
 Plain text sends to the active conversation: `#general` (everyone online), a `dm:<peer_id>` thread,
-or a private group (one encrypted direct message per member). Messages to offline recipients stay
-marked ` (Pending)` in memory in phase 2; phase 3 will persist and retry them.
+or a private group (one encrypted direct message per member). Every chat line shows its local
+`HH:MM` timestamp. A send to an offline recipient stays marked `(Pending)` in the UI and is stored
+in `chat.db`. When that peer returns, the outbox worker
+retries the send; the marker disappears once every recipient has acknowledged it. Failed attempts
+retry at 1 s, 2 s, 4 s … capped at 5 minutes; nothing is dropped.
 
 ## Private groups
 
@@ -112,24 +118,30 @@ With the default `--data-dir data`:
 
 - `data/identity.key` — ed25519 private key (mode `0600` on Unix). The PeerId stays the same across
   restarts. Delete this file to get a new identity.
+- `data/chat.db` — SQLite database (WAL mode) holding peers, messages, group memberships and outbox
+  rows. History and Pending state survive restarts. Presence and in-flight delivery flags are reset
+  on startup because they describe the current process, not saved history.
 - `data/chat.log` — tracing output. Logs go to a file so the terminal stays clean, including in TUI
   mode. Set `RUST_LOG=debug` for verbose diagnostics.
 
 ## Layout
 
-- `src/main.rs` — identity loading, logging and wiring between network and UI; `--simple` selects the
-  fallback CLI.
+- `src/main.rs` — identity loading, logging and wiring between network, database worker and UI;
+  `--simple` selects the fallback CLI.
 - `src/network/` — swarm behaviour, mDNS/discovery events, wire protocol, group events and ACK
-  correlation by libp2p request id.
-- `src/ui/cli.rs` — phase 1 plain terminal prompt (`--simple`).
-- `src/ui/app.rs` — phase 2 state: peers, groups, conversations, pending ack map, stable colors, RAII
-  terminal guard.
-- `src/ui/input.rs` — phase 2 key handling, `/users` autofill, command parser.
+  correlation by libp2p request id or phase 3 outbox id.
+- `src/database/` — SQLite schema and the only connection to `chat.db`, owned by the worker.
+- `src/worker.rs` — `Store` request/reply API, outbox poll loop, retry backoff and event mirroring.
+- `src/ui/cli.rs` — phase 1 plain terminal prompt (`--simple`), kept as a fallback.
+- `src/ui/app.rs` — phase 2/3 state: peers, groups, conversations, pending ack map, stable colors,
+  history restoration and RAII terminal guard.
+- `src/ui/input.rs` — phase 2 key handling, `/users` autofill, command parser and channel navigation.
 - `src/ui/render.rs` — phase 2 ratatui layout and tests using `TestBackend`.
 
 Every module carries its own unit tests (`make test`). Real multi-peer behaviour is checked manually
-with two terminals, as described above.
+with two or more terminals, as described above.
 
 ## Roadmap
 
-- **Phase 3:** rusqlite local database, outbox worker, pending messages flushed when peers come online.
+All three planned phases are complete. Possible follow-ups: group encryption keys, leave/remove
+commands, manual `/connect <multiaddr>` for restricted networks, and message search/pagination.

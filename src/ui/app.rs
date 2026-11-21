@@ -14,7 +14,7 @@ use libp2p::PeerId;
 use ratatui::{backend::CrosstermBackend, style::Color, Terminal};
 use uuid::Uuid;
 
-use crate::network::{events::display_name, protocol::ChatMessage};
+use crate::{database::History, network::{events::display_name, protocol::ChatMessage}};
 
 pub const GENERAL: &str = "#general";
 /// Keep the TUI bounded in phase 2; phase 3 will read full history from SQLite.
@@ -38,6 +38,7 @@ pub enum ChatLine {
         author: String,
         peer: Option<PeerId>,
         body: String,
+        created_at: i64,
         mine: bool,
     },
     System(String),
@@ -150,6 +151,7 @@ pub fn make_message(
         channel,
         body,
         created_at: now_millis(),
+        outbox_id: None,
     }
 }
 
@@ -195,6 +197,76 @@ impl<'a> App<'a> {
             textarea,
             pending: HashMap::new(),
             seen_messages: HashSet::new(),
+        }
+    }
+
+    /// Fill the TUI from SQLite on startup without re-broadcasting presence from old messages.
+    pub fn apply_history(&mut self, history: History) {
+        for peer in history.peers {
+            if peer.is_local {
+                continue;
+            }
+            let Ok(peer_id) = peer.peer_id.parse::<PeerId>() else {
+                continue;
+            };
+            // Presence is live state, not history: a restored peer starts offline/gray until the
+            // connection or gossipsub announces it again.
+            self.add_or_update_peer(peer_id, &peer.username, false);
+        }
+        for group in history.groups {
+            let members = group
+                .members
+                .into_iter()
+                .filter_map(|peer| peer.parse::<PeerId>().ok())
+                .collect::<HashSet<_>>();
+            self.groups.push(crate::ui::app::Group {
+                id: group.id.clone(),
+                name: group.name,
+                members,
+            });
+            self.ensure_conversation(&group.id);
+        }
+        for message in history.messages {
+            if !self.seen_messages.insert(message.id.clone()) {
+                continue;
+            }
+            let mine = message.direction == "out";
+            let peer = message.peer_id.parse::<PeerId>().ok();
+            let key = if mine {
+                message.channel.clone()
+            } else if message.channel.starts_with("dm:") {
+                match peer {
+                    Some(peer) => format!("dm:{peer}"),
+                    None => continue,
+                }
+            } else {
+                match self.conversation_key_for(&message.channel) {
+                    Some(key) => key,
+                    None => continue,
+                }
+            };
+            self.push_line(
+                &key,
+                ChatLine::Message {
+                    id: message.id,
+                    author: message.username_snapshot,
+                    peer: if mine { Some(self.me) } else { peer },
+                    body: message.body,
+                    created_at: message.created_at,
+                    mine,
+                },
+            );
+        }
+        for id in history.pending_message_ids {
+            self.pending.entry(id).or_default();
+        }
+    }
+
+    pub fn set_message_pending(&mut self, message_id: &str, pending: bool) {
+        if pending {
+            self.pending.entry(message_id.to_string()).or_default();
+        } else {
+            self.pending.remove(message_id);
         }
     }
 
@@ -323,6 +395,7 @@ impl<'a> App<'a> {
                 author: message.from_username,
                 peer,
                 body: message.body,
+                created_at: message.created_at,
                 mine: false,
             },
         );
@@ -340,6 +413,7 @@ impl<'a> App<'a> {
                 author: self.username.clone(),
                 peer: Some(self.me),
                 body: message.body,
+                created_at: message.created_at,
                 mine: true,
             },
         );
@@ -513,6 +587,28 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Enter list navigation from the input; choose the panel matching the active conversation.
+    pub fn begin_selection(&mut self) {
+        if self.selection != Selection::None {
+            return;
+        }
+        if self.group(&self.active_conversation).is_some() {
+            self.selection = Selection::Groups;
+            self.group_selection = self
+                .groups
+                .iter()
+                .position(|group| group.id == self.active_conversation)
+                .unwrap_or(0);
+        } else {
+            self.selection = Selection::Channels;
+            self.channel_selection = self
+                .channel_keys()
+                .iter()
+                .position(|key| key == &self.active_conversation)
+                .unwrap_or(0);
+        }
+    }
+
     pub fn move_selection(&mut self, delta: isize) {
         if self.selection == Selection::None {
             return;
@@ -617,6 +713,7 @@ mod tests {
             channel: channel.to_string(),
             body: body.to_string(),
             created_at: 1,
+            outbox_id: None,
         }
     }
 
@@ -748,6 +845,73 @@ mod tests {
 
         app.move_selection(1);
         assert_eq!(app.channel_selection, 0); // wraps around
+    }
+
+    #[test]
+    fn history_restores_peers_groups_messages_and_pending_state() {
+        use crate::database::{History, StoredGroup, StoredMessage, StoredPeer};
+
+        let mut app = App::new(peer_a(), "alice".to_string());
+        let carol = PeerId::random();
+        let history = History {
+            peers: vec![
+                StoredPeer {
+                    peer_id: peer_b().to_string(),
+                    username: "bob".to_string(),
+                    is_local: false,
+                    online: false,
+                    first_seen: 1,
+                    last_seen: 2,
+                },
+                StoredPeer {
+                    peer_id: carol.to_string(),
+                    username: "carol".to_string(),
+                    is_local: true,
+                    online: true,
+                    first_seen: 1,
+                    last_seen: 2,
+                },
+            ],
+            messages: vec![
+                StoredMessage {
+                    id: "in-1".to_string(),
+                    channel: GENERAL.to_string(),
+                    peer_id: peer_b().to_string(),
+                    username_snapshot: "bob".to_string(),
+                    direction: "in".to_string(),
+                    body: "old hello".to_string(),
+                    created_at: 1,
+                },
+                StoredMessage {
+                    id: "out-1".to_string(),
+                    channel: format!("dm:{}", peer_b()),
+                    peer_id: peer_b().to_string(),
+                    username_snapshot: "alice".to_string(),
+                    direction: "out".to_string(),
+                    body: "queued".to_string(),
+                    created_at: 2,
+                },
+            ],
+            groups: vec![StoredGroup {
+                id: "g1".to_string(),
+                name: "team".to_string(),
+                members: vec![peer_a().to_string(), peer_b().to_string()],
+            }],
+            pending_message_ids: HashSet::from(["out-1".to_string()]),
+        };
+        app.apply_history(history);
+
+        assert!(app.peers.contains_key(&peer_b()));
+        assert!(!app.peers.contains_key(&carol)); // local rows are not peers in the UI
+        assert!(!app.peers[&peer_b()].online); // history does not imply live presence
+        assert_eq!(app.conversations[GENERAL].len(), 1);
+        assert_eq!(app.conversations[&format!("dm:{}", peer_b())].len(), 1);
+        assert_eq!(app.groups[0].name, "team");
+        assert!(app.is_group_member("g1"));
+        assert!(app.is_pending("out-1"));
+
+        app.set_message_pending("out-1", false);
+        assert!(!app.is_pending("out-1"));
     }
 
     #[test]

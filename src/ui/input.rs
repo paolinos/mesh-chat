@@ -127,6 +127,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
 
     match key.code {
         KeyCode::Up | KeyCode::Down => {
+            app.begin_selection();
             app.move_selection(if key.code == KeyCode::Up { -1 } else { 1 });
             InputResult::Redraw
         }
@@ -147,6 +148,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
             InputResult::Redraw
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            // Editing always means the user is talking to the input, not the channel list.
+            app.selection = Selection::None;
             app.textarea.input(Input {
                 key: tui_textarea::Key::Enter,
                 ctrl: false,
@@ -174,6 +177,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
             }
         },
         _ => {
+            // If the user picked a channel with ↑/↓ and starts typing, return focus to the input.
+            // Otherwise the next Enter would only re-activate the highlighted channel.
+            app.selection = Selection::None;
             app.textarea.input(Input::from(key));
             InputResult::Redraw
         }
@@ -263,6 +269,56 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::SHIFT));
         app.textarea.insert_str("second");
         assert_eq!(app.textarea_text(), "first\nsecond");
+    }
+
+    #[test]
+    fn up_enters_channel_selection_from_input() {
+        let mut app = App::new(PeerId::random(), "me".to_string());
+        let bob = PeerId::random();
+        app.add_or_update_peer(bob, "bob", true);
+        assert_eq!(app.selection, Selection::None);
+
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE)),
+            InputResult::Redraw
+        );
+        assert_eq!(app.selection, Selection::Channels);
+        assert_eq!(app.channel_selection, 1); // wrapped from #general to the DM
+
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE)),
+            InputResult::Redraw
+        );
+        assert_eq!(app.active_conversation, format!("dm:{bob}"));
+    }
+
+    #[test]
+    fn typing_after_channel_selection_sends_with_enter() {
+        let mut app = App::new(PeerId::random(), "me".to_string());
+        let bob = PeerId::random();
+        app.add_or_update_peer(bob, "bob", true);
+
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE)),
+            InputResult::Redraw
+        );
+        assert_eq!(app.selection, Selection::Channels);
+
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('h'), KeyModifiers::NONE)),
+            InputResult::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('i'), KeyModifiers::NONE)),
+            InputResult::Redraw
+        );
+        assert_eq!(app.selection, Selection::None);
+        assert_eq!(app.textarea_text(), "hi");
+
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE)),
+            InputResult::Action(Action::SendChat("hi".to_string()))
+        );
     }
 
     #[test]

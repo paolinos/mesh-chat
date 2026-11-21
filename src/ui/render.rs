@@ -1,3 +1,5 @@
+use time::{OffsetDateTime, UtcOffset};
+
 use ratatui::{
     layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
@@ -7,6 +9,15 @@ use ratatui::{
 };
 
 use super::app::{App, ChatLine, Selection, GENERAL, OWN_COLOR};
+
+/// Render a stored epoch-millisecond timestamp as local `HH:MM`.
+/// Falls back to UTC if the platform cannot determine the local offset.
+fn format_time(created_at: i64) -> String {
+    let stamp = OffsetDateTime::from_unix_timestamp(created_at.div_euclid(1_000))
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    let local = stamp.to_offset(UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
+    format!("{:02}:{:02}", local.hour(), local.minute())
+}
 
 fn selected(active: bool) -> Style {
     if active {
@@ -117,6 +128,7 @@ fn chat_lines(app: &App) -> Vec<Line<'static>> {
                 author,
                 peer,
                 body,
+                created_at,
                 mine,
             } => {
                 // A live (online) sender is green, matching their green channel label;
@@ -137,11 +149,13 @@ fn chat_lines(app: &App) -> Vec<Line<'static>> {
                 } else {
                     ""
                 };
+                let first_prefix = format!("[{}] {name}: ", format_time(*created_at));
+                let continuation = " ".repeat(first_prefix.chars().count());
                 for (index, part) in body.split('\n').enumerate() {
                     let prefix = if index == 0 {
-                        format!("{name}: ")
+                        first_prefix.clone()
                     } else {
-                        "  ".to_string()
+                        continuation.clone()
                     };
                     let mut spans = vec![
                         Span::styled(prefix, Style::default().fg(color)),
@@ -251,11 +265,11 @@ mod tests {
         app.add_or_update_peer(bob, "bob", true);
         let group_id = app.create_group("team");
         app.activate_conversation(GENERAL);
-        app.record_incoming(make_message(&me, "bob", GENERAL.to_string(), "hey from bob".to_string()));
-        app.record_outgoing(
-            make_message(&me, "alice", GENERAL.to_string(), "hi from me".to_string()),
-            vec![bob],
-        );
+        let incoming_message = make_message(&me, "bob", GENERAL.to_string(), "hey from bob".to_string());
+        let outgoing_message =
+            make_message(&me, "alice", GENERAL.to_string(), "hi from me".to_string());
+        app.record_incoming(incoming_message.clone());
+        app.record_outgoing(outgoing_message.clone(), vec![bob]);
 
         let screen = rendered(&app);
         assert!(!screen.contains("USERS"));
@@ -270,9 +284,13 @@ mod tests {
 
         let incoming = row_with(&screen, "hey from bob");
         let outgoing = row_with(&screen, "hi from me");
+        assert!(incoming.contains(&format_time(incoming_message.created_at)));
+        assert!(outgoing.contains(&format_time(outgoing_message.created_at)));
+        assert!(outgoing.contains("(Pending)"));
         let incoming_col = incoming.find("hey from bob").unwrap();
         let outgoing_col = outgoing.find("hi from me").unwrap();
-        assert!(incoming_col < 40, "incoming text should be left aligned");
+        assert!(incoming_col < outgoing_col, "incoming text should be left of own text");
+        assert!(incoming_col < 50, "incoming text should be left aligned");
         assert!(outgoing_col > 55, "own text should be right aligned");
 
         assert!(app.group(&group_id).is_some());

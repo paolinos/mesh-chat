@@ -76,6 +76,7 @@ pub fn make_chat_message(local_peer_id: &PeerId, username: &str, body: String) -
         channel: "#general".to_string(),
         body,
         created_at: now_millis(),
+        outbox_id: None,
     }
 }
 
@@ -283,6 +284,7 @@ mod tests {
             channel: "#general".to_string(),
             body: "hi there".to_string(),
             created_at: 1,
+            outbox_id: None,
         };
         let text = format_event(&NetworkEvent::MessageReceived { message }).unwrap();
         assert!(text.contains("hi there"));

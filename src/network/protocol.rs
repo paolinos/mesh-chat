@@ -17,12 +17,18 @@ pub enum ChatRequest {
         group_id: String,
         group_name: String,
         invited_by: String,
+        /// Phase-3 outbox id echoed back in the ACK. `None` for older peers.
+        #[serde(default)]
+        outbox_id: Option<u64>,
     },
     MemberAdded {
         group_id: String,
         peer_id: String,
         username: String,
         invited_by: String,
+        /// Phase-3 outbox id echoed back in the ACK. `None` for older peers.
+        #[serde(default)]
+        outbox_id: Option<u64>,
     },
 }
 
@@ -48,6 +54,9 @@ pub struct ChatMessage {
     pub channel: String,
     pub body: String,
     pub created_at: i64,
+    /// Phase-3 outbox id echoed back in the ACK. `None` for older peers or incoming messages.
+    #[serde(default)]
+    pub outbox_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +85,7 @@ mod tests {
             channel: "#general".to_string(),
             body: "hello\nworld".to_string(),
             created_at: 42,
+            outbox_id: None,
         });
         let bytes = serde_json::to_vec(&request).unwrap();
         assert_eq!(serde_json::from_slice::<ChatRequest>(&bytes).unwrap(), request);
@@ -87,6 +97,7 @@ mod tests {
             group_id: "g-1".to_string(),
             group_name: "team".to_string(),
             invited_by: "peer-a".to_string(),
+            outbox_id: Some(7),
         };
         let bytes = serde_json::to_vec(&invite).unwrap();
         assert_eq!(serde_json::from_slice::<ChatRequest>(&bytes).unwrap(), invite);
@@ -96,9 +107,37 @@ mod tests {
             peer_id: "peer-b".to_string(),
             username: "bob".to_string(),
             invited_by: "peer-a".to_string(),
+            outbox_id: Some(8),
         };
         let bytes = serde_json::to_vec(&member).unwrap();
         assert_eq!(serde_json::from_slice::<ChatRequest>(&bytes).unwrap(), member);
+    }
+
+    #[test]
+    fn older_payloads_without_outbox_id_still_deserialize() {
+        let old = r##"{
+            "Chat": {
+                "id": "m-1",
+                "from_peer": "peer",
+                "from_username": "alice",
+                "channel": "#general",
+                "body": "hello",
+                "created_at": 42
+            }
+        }"##;
+        let request: ChatRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            request,
+            ChatRequest::Chat(ChatMessage {
+                id: "m-1".to_string(),
+                from_peer: "peer".to_string(),
+                from_username: "alice".to_string(),
+                channel: "#general".to_string(),
+                body: "hello".to_string(),
+                created_at: 42,
+                outbox_id: None,
+            })
+        );
     }
 
     #[test]
