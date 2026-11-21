@@ -44,40 +44,45 @@ make run ARGS="--data-dir data/bob"
 ```
 
 (Equivalent: `cargo run -- --data-dir data/alice`.) Each directory gets its own `identity.key` and
-`chat.log`. Both instances should discover each other within a few seconds and show each other in the
-USERS panel. On two different laptops, the default `make run` is enough.
+`chat.log`. Both instances should discover each other within a few seconds; type `/users` to see the
+known peers. On two different laptops, the default `make run` is enough.
 
 ## TUI layout and keys
 
 ```
 ┌──────────────┬───────────────────────────────────────────┐
-│ USERS        │  #general | alice·12ab | 🔒 team          │
-│ ● alice·12ab ├───────────────────────────────────────────┤
-│ ○ bob·9f03   │  bob·9f03: hey                            │
+│ CHANNELS     │  #general | DM alice·12ab | 🔒 team       │
+│ #general     ├───────────────────────────────────────────┤
+│ DM alice·12ab│  alice·12ab: hey                          │
 │              │                       me: hi              │
-│ CHANNELS     │  bob·9f03: multi-line                     │
-│ #general     │            message                        │
-│              ├───────────────────────────────────────────┤
-│ GROUPS       │  Message (Shift+Enter = newline)          │
-│ 🔒 team      │                                           │
+│              │  alice·12ab: multi-line                   │
+│              │                   message                 │
+│ GROUPS       ├───────────────────────────────────────────┤
+│ 🔒 team      │  Message (Shift+Enter = newline)          │
 └──────────────┴───────────────────────────────────────────┘
 ```
 
 - `Enter` sends the current input. `Shift+Enter` inserts a newline.
-- `↑`/`↓` select a user or group in the active left panel.
-- `Tab` autofills `/users <selected-name> ` into the input.
+- `↑`/`↓` select a channel or group in the left panel.
+- `Enter` or `Tab` switches to the highlighted channel/group; `Esc` returns focus to the input.
 - `/quit`, `/exit`, or `Ctrl+C` exits and always restores the terminal.
-- Clicking/selecting is keyboard-only in v1: use `/users` to reach DMs and group commands to create
-  or enter groups. Selecting `#general` in CHANNELS switches back to the public room.
+- There is no USERS panel: `/users` prints the known peers into the chat panel. DMs appear directly
+  in CHANNELS as `DM name·suffix` as soon as a peer connects (presence/connection event), before any
+  message is exchanged.
 
 Because usernames are only labels, every peer is shown as `name·<last4 of PeerId>` (PeerIds all start
 with `12D3`, so the suffix is the distinguishing part). Names are resolved by prefix in commands.
+Connected peers are shown in **green** in their DM channel label, and their broadcast/DM messages
+are green too; offline or unknown senders are gray. Any incoming message (including a `#general`
+broadcast) registers the sender as online, so a just-connected peer appears green immediately.
+Messages from an unknown sender create the canonical `dm:<peer-id>` thread and learn that user's
+name from the message, rather than opening an extra "unknown" channel.
 
 ## Commands
 
 | Command | Effect |
 | --- | --- |
-| `/users` | Show the user list in USERS; `↑`/`↓` then `Enter` inserts `/users <name> ` |
+| `/users` | Print known peers in the chat panel |
 | `/users <name> <body…>` | Send a direct message; body may be multiline |
 | `/group create <name>` | Create a private group; only you see it at first |
 | `/group add <group> <name>` | Invite a user; any member can invite more users |

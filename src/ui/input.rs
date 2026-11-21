@@ -132,8 +132,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
         }
         KeyCode::Tab => {
             match app.selection {
-                Selection::Users => {
-                    app.autofill_user();
+                Selection::Channels => {
+                    app.activate_selected_channel();
                 }
                 Selection::Groups => {
                     app.activate_selected_group();
@@ -156,8 +156,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
             InputResult::Redraw
         }
         KeyCode::Enter => match app.selection {
-            Selection::Users => {
-                app.autofill_user();
+            Selection::Channels => {
+                app.activate_selected_channel();
                 InputResult::Redraw
             }
             Selection::Groups => {
@@ -169,11 +169,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
                 app.clear_textarea();
                 match parse_input(&text) {
                     Command::Chat(body) => InputResult::Action(Action::SendChat(body)),
-                    Command::Users => {
-                        app.selection = Selection::Users;
-                        app.user_selection = 0;
-                        InputResult::Action(Action::Users)
-                    }
                     command => command_to_action(command),
                 }
             }
@@ -271,22 +266,29 @@ mod tests {
     }
 
     #[test]
-    fn users_list_enter_autofills_and_tab_cycles() {
+    fn users_command_lists_and_channel_selection_activates() {
         let mut app = App::new(PeerId::random(), "me".to_string());
-        let bob = PeerId::random();
-        app.add_or_update_peer(bob, "bob", true);
         app.textarea.insert_str("/users");
         assert_eq!(
             handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE)),
             InputResult::Action(Action::Users)
         );
+        assert_eq!(app.selection, Selection::None);
+
+        let bob = PeerId::random();
+        app.add_or_update_peer(bob, "bob", true);
+        let dm = format!("dm:{bob}");
+        app.activate_conversation(&dm);
+        app.selection = Selection::Channels;
+        app.channel_selection = 1;
         assert_eq!(
             handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE)),
             InputResult::Redraw
         );
-        assert_eq!(app.textarea_text(), "/users bob ");
-        assert_eq!(app.selection, Selection::None);
+        assert_eq!(app.active_conversation, dm);
 
+        app.selection = Selection::Channels;
+        app.channel_selection = 0;
         assert_eq!(
             handle_key(&mut app, key(KeyCode::Tab, KeyModifiers::NONE)),
             InputResult::Redraw

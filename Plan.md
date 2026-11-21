@@ -9,7 +9,7 @@ messages to offline peers wait until those peers come back.
 The project is built incrementally in **3 phases**. Each phase leaves the app working; phase 2
 replaces the plain CLI with a TUI, phase 3 adds persistence without changing the UI contract.
 
-**Status:** Phases 1 and 2 are implemented and verified (`make test`: 40 passing tests); phase 3 is
+**Status:** Phases 1 and 2 are implemented and verified (`make test`: 42 passing tests); phase 3 is
 pending. The phase 1 UI is still available as `--simple`.
 
 ---
@@ -22,8 +22,8 @@ pending. The phase 1 UI is still available as `--simple`.
 | Private groups | Creator creates a group nobody sees; adding a user sends a private invite; **any member can invite more users** (chain invites); no history backfill for new members; no leave/remove in v1 |
 | Group message delivery | **One direct message per member** with a `group_id` field — no broadcast, no topic name exposed to non-members |
 | Presence | Broadcast join/leave to all peers on the network (gossipsub `chat/presence`), so every peer's left panel updates |
-| Colors | Each user gets a **stable color derived from their PeerId**, used in every channel; your own messages use one fixed color |
-| `/users` UX | `/users` shows the list, ↑/↓ selects, Enter auto-fills `/users <name> `; user types the (possibly multiline) message and presses Enter |
+| Colors | Online users (and their messages) are **green**, offline/unknown users are gray; your own messages are also green. The stable PeerId color helper remains available for future per-user accents |
+| `/users` UX | No USERS side panel: `/users` prints the peer list in the chat panel; CHANNELS shows `#general` and a DM channel for every connected peer as soon as presence arrives; ↑/↓ + Enter/Tab switches channels; user types `/users <name> <body…>` for a DM |
 | Identity | Private key stored in a file **in the application folder**, and the `PeerId` + username stored in the local database (DB is authoritative for display; file is authoritative for the key) |
 | Offline messages | Never dropped. They stay in the outbox as **Pending**, and are flushed when the recipient broadcasts that it is online. UI shows ` (Pending)` until delivered |
 
@@ -155,7 +155,7 @@ src/
     mod.rs                 # run_ui() entry point
     cli.rs                 # phase 1: plain terminal prompt + println notifications
     app.rs                 # phase 2: App state (peers, groups, conversations, input, selection)
-    input.rs               # phase 2: crossterm keys, /users, /group commands, autofill
+    input.rs               # phase 2: crossterm keys, /users, /group commands, channel navigation
     render.rs              # phase 2: ratatui layout, per-user colors, Pending marker
   database/
     mod.rs                 # Db wrapper, open + migrate
@@ -185,7 +185,7 @@ multi-process LAN checks stay documented as manual reproduction steps in the REA
 | `main.rs` | Username validation, identity load-or-create against a `tempfile` directory, event/command routing helpers. Keep wiring thin so these helpers are testable |
 | `network/` | Cbor round-trip of `ChatRequest`/`ChatResponse`, mDNS discovered-address dedupe, `PeerId -> username` resolution including duplicate-name suffixes, synthetic-event → `NetworkEvent` mapping, presence transitions |
 | `ui/cli.rs` | Input parsing (`/quit`, empty lines), username display formatting, notification rendering from fixed fixtures |
-| `ui/app.rs` / `input.rs` / `render.rs` (phase 2) | `/users` and `/group` command parsing, `/users` auto-fill, invite/`MemberAdded` state transitions, group isolation, stable color from a fixed PeerId, ` (Pending)` derivation, ratatui `TestBackend` snapshots for left/right alignment |
+| `ui/app.rs` / `input.rs` / `render.rs` (phase 2) | `/users` and `/group` command parsing, `/users` listing, channel selection, invite/`MemberAdded` state transitions, group isolation, stable color from a fixed PeerId, ` (Pending)` derivation, ratatui `TestBackend` snapshots for left/right alignment |
 | `database/` | Migration is idempotent on an empty `tempfile` DB, insert/query round-trips for messages/outbox/groups/members, UUID dedupe, `online = 1` filtering query |
 | `worker/` | Outbox claim → ack → `done`, failure/backoff progression, per-recipient fan-out rows for groups, `PeerOnline` immediate flush, offline rows never dequeued, shutdown |
 | Integration (optional, later) | Spawn two app processes on the LAN and assert join/DM/group behaviour; keep these separate from `cargo test` so unit tests stay deterministic |
@@ -312,37 +312,37 @@ struct Presence { peer_id: String, username: String, online: bool }
      `<group_uuid>`.
    - `groups: Vec<Group { id, name, members: HashSet<PeerId> }>` — **only groups you are a member of**
      are stored/rendered. Non-members never receive any group event.
-   - `active_conversation`, `user_list_visible`, `textarea`, `user_selection`, `group_selection`.
+   - `active_conversation`, `textarea`, `channel_selection`, `group_selection`; no USERS panel.
 4. **Layout** (`ui/render.rs`):
    ```
    ┌──────────────┬───────────────────────────────────────────┐
-   │ USERS        │  #general | alice·12ab | 🔒 team          │
-   │ ● alice      ├───────────────────────────────────────────┤
-   │ ○ bob        │  alice: hey                               │
+   │ CHANNELS     │  #general | DM alice·12ab | 🔒 team       │
+   │ #general     ├───────────────────────────────────────────┤
+   │ DM alice·12ab│  alice: hey                               │
    │              │              me: hi                       │
-   │ CHANNELS     │  alice: multi-line                        │
-   │ #general     │         message                           │
-   │              ├───────────────────────────────────────────┤
-   │ GROUPS       │  Type a message (Shift+Enter = newline)  │
-   │ 🔒 team      │                                           │
+   │              │  alice: multi-line                        │
+   │              │         message                           │
+   │ GROUPS       ├───────────────────────────────────────────┤
+   │ 🔒 team      │  Type a message (Shift+Enter = newline)  │
    └──────────────┴───────────────────────────────────────────┘
    ```
    - Left column ~20–25%; right column = chat history (flex) + input (grows with line count).
-   - Incoming message author name and text use that peer's stable color; your own messages are
-     right-aligned in green. System notices are dim italic.
+   - Incoming message author name and text are green when the sender is online, gray when offline or
+     unknown; your own messages are right-aligned in green. System notices are dim italic. Any
+     incoming message registers the sender as online so broadcasts show green immediately.
    - Delivery state suffix: ` (Pending)` while any recipient has not acked; no suffix once all
      acks arrive. Phase 2 tracks this in memory; phase 3 reads it from the outbox.
 5. **Keys** (`ui/input.rs`):
-   - `Enter` send, `Shift+Enter` newline, `↑`/`↓` select in the active list (users or groups),
-     `Tab` autofill, `Ctrl+C` / `/quit` exit.
-   - `/users` → print list, activate user selection; Enter inserts `/users <name> ` into the textarea.
+   - `Enter` send, `Shift+Enter` newline, `↑`/`↓` select in the active list (channels or groups),
+     `Enter`/`Tab` activate the selection, `Esc` returns to input, `Ctrl+C` / `/quit` exit.
+   - `/users` → print the known peers in the chat panel; no user side panel or autofill.
    - `/users <name> <body…>` → resolve name → PeerId, send DM (multiline body allowed).
    - `/group create <name>` → create a private group (`uuid` id, creator as first member), add to
      left panel; nobody else is contacted.
    - `/group add <group> <username>` → resolve user, send `GroupInvite` **to that user** and
      `MemberAdded` **to every current member**; no history is sent.
    - `/group members <group>` → list members in the chat panel (useful for chain invites).
-   - Selecting a group (or `#general`, or a user) sets the active conversation; plain Enter sends the
+   - Selecting a group or a channel (`#general` or a DM) sets the active conversation; plain Enter sends the
      typed body there. Sending to a group means one DM per member via the network task.
    - Unknown `/…` → short help text.
 6. **Group event handling** in `main.rs` / `ui/app.rs`:
@@ -359,7 +359,7 @@ struct Presence { peer_id: String, username: String, online: bool }
 - B adds C → C gets an invite, and **A also learns C joined** via `MemberAdded`; no history backfill.
 - A message in `team` reaches A, B and C only; each sender's color is the same in `#general`, DMs,
   and `team`. Your own messages are always green.
-- `/users` auto-fill + multiline DM works; `(Pending)` appears when a recipient is offline.
+- `/users` lists peers in chat; channel selection + multiline DM works; `(Pending)` appears when a recipient is offline.
 - Raw mode restored on exit.
 - Unit tests cover every phase-2 module (`ui/app.rs`, `ui/input.rs`, `ui/render.rs`, group event
   handling and the new `network/` cases); `make test` passes.

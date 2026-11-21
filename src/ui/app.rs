@@ -54,7 +54,7 @@ pub struct Group {
 pub enum Selection {
     #[default]
     None,
-    Users,
+    Channels,
     Groups,
 }
 
@@ -168,7 +168,7 @@ pub struct App<'a> {
     pub groups: Vec<Group>,
     pub active_conversation: String,
     pub selection: Selection,
-    pub user_selection: usize,
+    pub channel_selection: usize,
     pub group_selection: usize,
     pub textarea: tui_textarea::TextArea<'a>,
     /// message id -> peers whose ACK has not arrived yet.
@@ -190,7 +190,7 @@ impl<'a> App<'a> {
             groups: Vec::new(),
             active_conversation: GENERAL.to_string(),
             selection: Selection::None,
-            user_selection: 0,
+            channel_selection: 0,
             group_selection: 0,
             textarea,
             pending: HashMap::new(),
@@ -221,6 +221,9 @@ impl<'a> App<'a> {
                 );
             }
         }
+        // A connection/presence event is enough to expose the DM channel; the user should not
+        // have to send the first message before the peer appears in CHANNELS.
+        self.ensure_conversation(&format!("dm:{peer_id}"));
     }
 
     pub fn set_peer_online(&mut self, peer_id: PeerId, online: bool) {
@@ -250,6 +253,20 @@ impl<'a> App<'a> {
         self.conversations.keys().cloned().collect()
     }
 
+    /// Keys shown in the CHANNELS panel: `#general` plus DMs with a valid peer id.
+    pub fn channel_keys(&self) -> Vec<String> {
+        self.conversations
+            .keys()
+            .filter(|key| {
+                key.as_str() == GENERAL
+                    || key
+                        .strip_prefix("dm:")
+                        .is_some_and(|value| value.parse::<PeerId>().is_ok())
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn activate_conversation(&mut self, key: &str) {
         self.ensure_conversation(key);
         self.active_conversation = key.to_string();
@@ -275,16 +292,30 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Returns false for a duplicate or for a group we are not a member of.
+    /// Returns false for a duplicate, an unparseable DM sender, or a group we are not in.
     pub fn record_incoming(&mut self, message: ChatMessage) -> bool {
         if !self.seen_messages.insert(message.id.clone()) {
             return false;
         }
-        let key = match self.conversation_key_for(&message.channel) {
-            Some(key) => key,
-            None => return false,
-        };
         let peer = message.from_peer.parse::<PeerId>().ok();
+        // Any incoming message proves the sender is connected, including a `#general` broadcast.
+        // Learn their name and online state so the UI shows them in green, not offline gray.
+        if let Some(peer) = peer {
+            self.add_or_update_peer(peer, &message.from_username, true);
+        }
+        let key = if message.channel.starts_with("dm:") {
+            // The sender is the DM partner on our side, regardless of the channel string the
+            // peer used. This keeps every DM in `dm:<peer_id>` instead of creating stray threads.
+            match peer {
+                Some(peer) => format!("dm:{peer}"),
+                None => return false,
+            }
+        } else {
+            match self.conversation_key_for(&message.channel) {
+                Some(key) => key,
+                None => return false,
+            }
+        };
         self.push_line(
             &key,
             ChatLine::Message {
@@ -336,9 +367,10 @@ impl<'a> App<'a> {
         self.pending.contains_key(message_id)
     }
 
-    /// `#general` and DMs are always visible; group channels only if we are a member.
+    /// `#general` is always visible; DMs are canonicalized by `record_incoming`, and group
+    /// channels are only visible if we are a member.
     fn conversation_key_for(&self, channel: &str) -> Option<String> {
-        if channel == GENERAL || channel.starts_with("dm:") {
+        if channel == GENERAL {
             return Some(channel.to_string());
         }
         self.groups
@@ -486,38 +518,48 @@ impl<'a> App<'a> {
             return;
         }
         let count = match self.selection {
-            Selection::Users => self.sorted_peers().len(),
+            Selection::Channels => self.channel_keys().len(),
             Selection::Groups => self.groups.len(),
             Selection::None => 0,
         };
         if count == 0 {
             return;
         }
-        let selected = if self.selection == Selection::Users {
-            &mut self.user_selection
+        let selected = if self.selection == Selection::Channels {
+            &mut self.channel_selection
         } else {
             &mut self.group_selection
         };
         *selected = (*selected as isize + delta).rem_euclid(count as isize) as usize;
     }
 
-    /// Enter/Tab on a highlighted user inserts `/users <name> ` for the user to finish.
-    pub fn autofill_user(&mut self) -> bool {
-        let peers = self.sorted_peers();
-        let Some(peer_id) = peers.get(self.user_selection).copied() else {
+    /// Enter/Tab on a highlighted channel switches to it.
+    pub fn activate_selected_channel(&mut self) -> bool {
+        let Some(key) = self.channel_keys().get(self.channel_selection).cloned() else {
             return false;
         };
-        let name = self
-            .peers
-            .get(&peer_id)
-            .map(|peer| peer.username.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        self.textarea = tui_textarea::TextArea::new(vec![format!("/users {name} ")]);
-        self.textarea
-            .set_placeholder_text("Type a message; Shift+Enter inserts a newline");
-        self.textarea.move_cursor(tui_textarea::CursorMove::End);
-        self.selection = Selection::None;
+        self.activate_conversation(&key);
         true
+    }
+
+    /// `/users` prints the known peers into the chat panel instead of using a side panel.
+    pub fn users_summary(&self) -> String {
+        if self.peers.is_empty() {
+            return "No peers seen yet — wait for mDNS discovery".to_string();
+        }
+        let peers = self
+            .sorted_peers()
+            .into_iter()
+            .map(|peer| {
+                let marker = if self.peers[&peer].online {
+                    "●"
+                } else {
+                    "○"
+                };
+                format!("{marker} {}", self.peer_label(&peer))
+            })
+            .collect::<Vec<_>>();
+        format!("Users ({}): {}", peers.len(), peers.join(", "))
     }
 
     pub fn textarea_text(&self) -> String {
@@ -591,9 +633,29 @@ mod tests {
         assert!(app.record_incoming(message(GENERAL, "m1", "hello")));
         assert!(!app.record_incoming(message(GENERAL, "m1", "hello")));
         assert_eq!(app.conversations[GENERAL].len(), 1);
+        // A broadcast also teaches us who is online, so it is shown in green.
+        assert_eq!(app.peers[&peer_b()].username, "bob");
+        assert!(app.peers[&peer_b()].online);
 
-        assert!(app.record_incoming(message("dm:unknown", "m2", "private")));
-        assert_eq!(app.conversation_keys(), vec![GENERAL.to_string(), "dm:unknown".to_string()]);
+        // An incoming DM always lands in the canonical `dm:<sender>` thread, even if the
+        // sender used a different channel string, and teaches us their username.
+        let wrong_channel = format!("dm:{}", peer_a());
+        assert!(app.record_incoming(message(&wrong_channel, "m2", "private")));
+        let dm_key = format!("dm:{}", peer_b());
+        assert_eq!(
+            app.conversation_keys(),
+            vec![GENERAL.to_string(), dm_key.clone()]
+        );
+        assert_eq!(app.peers[&peer_b()].username, "bob");
+        assert!(app.peers[&peer_b()].online);
+
+        // A DM with an unparseable sender must not create a stray channel.
+        let bad_sender = ChatMessage {
+            from_peer: "not-a-peer".to_string(),
+            ..message("dm:not-a-peer", "m5", "ignored")
+        };
+        assert!(!app.record_incoming(bad_sender));
+        assert_eq!(app.conversation_keys(), vec![GENERAL.to_string(), dm_key]);
 
         let group_id = "secret-group";
         assert!(!app.record_incoming(message(group_id, "m3", "hidden")));
@@ -668,17 +730,24 @@ mod tests {
     }
 
     #[test]
-    fn users_autofill_and_selection() {
+    fn channel_selection_and_users_summary() {
         let mut app = App::new(peer_a(), "alice".to_string());
         app.add_or_update_peer(peer_b(), "bob", true);
-        app.selection = Selection::Users;
-        assert!(app.autofill_user());
-        assert_eq!(app.textarea_text(), "/users bob ");
-        assert_eq!(app.selection, Selection::None);
+        assert!(app.users_summary().contains("bob·"));
 
-        app.selection = Selection::Users;
+        // The DM channel exists as soon as presence arrives, before any message is sent.
+        let dm = format!("dm:{}", peer_b());
+        assert_eq!(app.channel_keys(), vec![GENERAL.to_string(), dm.clone()]);
+        app.activate_conversation(&dm);
+
+        app.selection = Selection::Channels;
         app.move_selection(1);
-        assert_eq!(app.user_selection, 0); // wraps with a single peer
+        assert_eq!(app.channel_selection, 1);
+        assert!(app.activate_selected_channel());
+        assert_eq!(app.active_conversation, dm);
+
+        app.move_selection(1);
+        assert_eq!(app.channel_selection, 0); // wraps around
     }
 
     #[test]

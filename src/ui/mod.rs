@@ -14,7 +14,7 @@ use crate::network::{
     NetworkCommand, NetworkEvent,
 };
 
-use app::{make_message, App, Selection, GENERAL};
+use app::{make_message, App, GENERAL};
 use input::{Action, InputResult};
 
 fn handle_network_event(app: &mut App, event: NetworkEvent) {
@@ -150,9 +150,8 @@ pub async fn handle_action(
             Err(error) => app.system(error.to_string()),
         },
         Action::Users => {
-            app.selection = Selection::Users;
-            app.user_selection = 0;
-            app.system("↑/↓ select a user, then Enter to insert '/users <name> '.");
+            let summary = app.users_summary();
+            app.system(summary);
         }
         Action::GroupCreate(name) => {
             let id = app.create_group(&name);

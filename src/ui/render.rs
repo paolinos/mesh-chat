@@ -16,42 +16,42 @@ fn selected(active: bool) -> Style {
     }
 }
 
-fn users_list(app: &App) -> Vec<ListItem<'static>> {
-    app.sorted_peers()
-        .into_iter()
-        .enumerate()
-        .map(|(index, peer_id)| {
-            let label = app.peer_label(&peer_id);
-            let marker = if app.peers.get(&peer_id).is_some_and(|peer| peer.online) {
-                "●"
-            } else {
-                "○"
-            };
-            ListItem::new(format!("{marker} {label}")).style(selected(
-                app.selection == Selection::Users && index == app.user_selection,
-            ))
-        })
-        .collect()
+/// Online peers are green; offline peers are gray. Selection adds reverse video.
+fn peer_style(app: &App, peer_id: &libp2p::PeerId, active: bool) -> Style {
+    let online = app.peers.get(peer_id).is_some_and(|peer| peer.online);
+    let mut style = Style::default().fg(if online {
+        Color::Green
+    } else {
+        Color::DarkGray
+    });
+    if active {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
 }
 
 fn channels_list(app: &App) -> Vec<ListItem<'static>> {
-    let mut items = Vec::new();
-    for key in app.conversation_keys() {
-        if key == GENERAL {
-            items.push(ListItem::new(key.clone()).style(selected(
-                app.active_conversation == key && app.selection == Selection::None,
-            )));
-        } else if let Some(peer_id) = key.strip_prefix("dm:") {
-            if let Ok(peer_id) = peer_id.parse::<libp2p::PeerId>() {
-                items.push(
-                    ListItem::new(format!("DM {}", app.peer_label(&peer_id))).style(selected(
-                        app.active_conversation == key && app.selection == Selection::None,
-                    )),
-                );
+    app.channel_keys()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, key)| {
+            let active = (app.selection == Selection::Channels
+                && index == app.channel_selection)
+                || app.active_conversation == key;
+            if key == GENERAL {
+                Some(ListItem::new(key).style(selected(active)))
+            } else {
+                let peer_id = key
+                    .strip_prefix("dm:")?
+                    .parse::<libp2p::PeerId>()
+                    .ok()?;
+                Some(
+                    ListItem::new(format!("DM {}", app.peer_label(&peer_id)))
+                        .style(peer_style(app, &peer_id, active)),
+                )
             }
-        }
-    }
-    items
+        })
+        .collect()
 }
 
 fn groups_list(app: &App) -> Vec<ListItem<'static>> {
@@ -74,13 +74,13 @@ fn header(app: &App) -> Line<'static> {
         if index > 0 {
             spans.push(Span::raw(" | "));
         }
+        let dm_peer = key
+            .strip_prefix("dm:")
+            .and_then(|value| value.parse::<libp2p::PeerId>().ok());
         let label = if let Some(group) = app.group(key) {
             format!("🔒 {}", group.name)
-        } else if let Some(peer_id) = key.strip_prefix("dm:") {
-            match peer_id.parse::<libp2p::PeerId>() {
-                Ok(peer_id) => format!("DM {}", app.peer_label(&peer_id)),
-                Err(_) => key.clone(),
-            }
+        } else if let Some(peer_id) = dm_peer {
+            format!("DM {}", app.peer_label(&peer_id))
         } else {
             key.clone()
         };
@@ -88,6 +88,8 @@ fn header(app: &App) -> Line<'static> {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
+        } else if let Some(peer_id) = dm_peer {
+            peer_style(app, &peer_id, false)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -117,12 +119,17 @@ fn chat_lines(app: &App) -> Vec<Line<'static>> {
                 body,
                 mine,
             } => {
+                // A live (online) sender is green, matching their green channel label;
+                // offline or unknown senders are gray.
                 let color = if *mine {
                     OWN_COLOR
+                } else if peer
+                    .as_ref()
+                    .is_some_and(|peer| app.peers.get(peer).is_some_and(|peer| peer.online))
+                {
+                    Color::Green
                 } else {
-                    peer.as_ref().and_then(|peer| app.peers.get(peer))
-                        .map(|peer| peer.color)
-                        .unwrap_or(Color::Gray)
+                    Color::Gray
                 };
                 let name = if *mine { "me" } else { author.as_str() };
                 let suffix = if app.is_pending(id) {
@@ -161,14 +168,9 @@ fn chat_lines(app: &App) -> Vec<Line<'static>> {
 pub fn render(frame: &mut Frame, app: &App) {
     let [left, right] = Layout::horizontal([Constraint::Length(25), Constraint::Min(20)])
         .areas(frame.area());
-    let [users, channels, groups] =
-        Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(28), Constraint::Percentage(32)])
-            .areas(left);
+    let [channels, groups] =
+        Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(left);
 
-    frame.render_widget(
-        List::new(users_list(app)).block(Block::bordered().title("USERS")),
-        users,
-    );
     frame.render_widget(
         List::new(channels_list(app)).block(Block::bordered().title("CHANNELS")),
         channels,
@@ -212,13 +214,9 @@ mod tests {
     use super::*;
     use crate::ui::app::make_message;
     use libp2p::PeerId;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
-    fn rendered(app: &App) -> String {
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, app)).unwrap();
-        let buffer = terminal.backend().buffer();
+    fn buffer_text(buffer: &Buffer) -> String {
         let mut text = String::new();
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
@@ -227,6 +225,13 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    fn rendered(app: &App) -> String {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        buffer_text(terminal.backend().buffer())
     }
 
     fn row_with<'a>(screen: &'a str, needle: &str) -> &'a str {
@@ -253,7 +258,7 @@ mod tests {
         );
 
         let screen = rendered(&app);
-        assert!(screen.contains("USERS"));
+        assert!(!screen.contains("USERS"));
         assert!(screen.contains("CHANNELS"));
         assert!(screen.contains("GROUPS"));
         assert!(screen.contains("#general"));
@@ -271,5 +276,82 @@ mod tests {
         assert!(outgoing_col > 55, "own text should be right aligned");
 
         assert!(app.group(&group_id).is_some());
+    }
+
+    #[test]
+    fn dm_channel_labels_use_online_colors() {
+        let me: PeerId = "12D3KooWJ2q5Aj9fMZ43AFFz152XxBRQEDBsUo7hHKi4YpYJ4yyB"
+            .parse()
+            .unwrap();
+        let bob = PeerId::random();
+        let carol = PeerId::random();
+        let mut app = App::new(me, "alice".to_string());
+        app.add_or_update_peer(bob, "bob", true);
+        app.add_or_update_peer(carol, "carol", false);
+        app.activate_conversation(&format!("dm:{bob}"));
+        app.activate_conversation(&format!("dm:{carol}"));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let screen = buffer_text(terminal.backend().buffer());
+
+        // Only inspect the left panel: the right-hand header uses yellow for the active tab.
+        let fg_at = |needle: &str| {
+            for (row, line) in screen.lines().enumerate() {
+                let left: String = line.chars().take(25).collect();
+                if let Some(byte_col) = left.find(needle) {
+                    // Buffer coordinates are characters, but `find` returns a byte offset.
+                    let col = left[..byte_col].chars().count();
+                    return terminal.backend().buffer()[(col as u16, row as u16)].fg;
+                }
+            }
+            panic!("no left-panel row containing {needle}");
+        };
+
+        assert_eq!(fg_at(&format!("DM {}", app.peer_label(&bob))), Color::Green);
+        assert_eq!(
+            fg_at(&format!("DM {}", app.peer_label(&carol))),
+            Color::DarkGray
+        );
+    }
+
+    #[test]
+    fn broadcast_colors_follow_online_state() {
+        let me: PeerId = "12D3KooWJ2q5Aj9fMZ43AFFz152XxBRQEDBsUo7hHKi4YpYJ4yyB"
+            .parse()
+            .unwrap();
+        let bob = PeerId::random();
+        let carol = PeerId::random();
+        let mut app = App::new(me, "alice".to_string());
+        app.record_incoming(make_message(
+            &bob,
+            "bob",
+            GENERAL.to_string(),
+            "online broadcast".to_string(),
+        ));
+        app.record_incoming(make_message(
+            &carol,
+            "carol",
+            GENERAL.to_string(),
+            "offline broadcast".to_string(),
+        ));
+        app.set_peer_online(carol, false);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let screen = buffer_text(terminal.backend().buffer());
+
+        let fg_at = |needle: &str| {
+            for (row, line) in screen.lines().enumerate() {
+                if let Some(byte_col) = line.find(needle) {
+                    let col = line[..byte_col].chars().count();
+                    return terminal.backend().buffer()[(col as u16, row as u16)].fg;
+                }
+            }
+            panic!("no row containing {needle}");
+        };
+
+        assert_eq!(fg_at("online broadcast"), Color::Green);
+        assert_eq!(fg_at("offline broadcast"), Color::Gray);
     }
 }
