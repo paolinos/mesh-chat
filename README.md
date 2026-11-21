@@ -49,6 +49,30 @@ make run ARGS="--data-dir data/bob"
 `chat.db` and `chat.log`. Both instances should discover each other within a few seconds; type
 `/users` to see the known peers. On two different laptops, the default `make run` is enough.
 
+## Architecture
+
+```mermaid
+flowchart LR
+  Main["main.rs"] --> UI["ui/ TUI"]
+  Main --> Net["network/ swarm"]
+  Main --> Store["worker.rs Store"]
+
+  UI -->|"send / group command"| Store
+  Store -->|"oneshot reply: history, Pending"| UI
+  Store --> Worker["DB worker"]
+  Worker --> DB[("chat.db")]
+  Worker -->|"due outbox rows"| Net
+  Net -->|"NetworkEvent"| UI
+  Net -->|"ACK, presence, message, group events"| Worker
+
+  Net -->|"mDNS discovery + Noise request/response + gossipsub presence"| Peers["Other LAN peers"]
+  Peers -->|"same protocols"| Net
+```
+
+`main.rs` wires the three owners together: the TUI draws state, the worker is the only owner of
+SQLite, and `network/` owns the swarm. Every network event is mirrored to the worker and the UI, so
+presence can flush the outbox while the same event updates the chat panel.
+
 ## TUI layout and keys
 
 ```
