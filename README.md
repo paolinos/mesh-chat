@@ -10,8 +10,14 @@ History, group memberships and undelivered messages are kept in a local SQLite d
 
 Requirements:
 
-- Rust 1.88+ (developed with 1.97).
+- Rust 1.97.1 (pinned in `rust-toolchain.toml`; MSRV 1.88).
 - All peers on the same local network, with UDP 5353 multicast available.
+
+Platform notes for released binaries:
+
+- **Linux (x64 / ARM64):** dynamically linked against glibc; needs a glibc at least as new as the build host's.
+- **macOS (x64 / ARM64):** separate thin binaries, no universal build. Binaries are unsigned, so Gatekeeper may warn on first launch.
+- **Windows (x64 / ARM64):** unsigned executables may trigger a SmartScreen warning.
 
 ```sh
 make build   # cargo build
@@ -20,6 +26,8 @@ make run     # cargo run (full-screen TUI)
 ```
 
 You will be asked for a username, then the full-screen UI opens. A real terminal is recommended because the UI uses the alternate screen and raw mode.
+
+`make build` produces an optimized native binary in `target/release/`. Cross-target builds, the release pipeline, tooling requirements and limitations are documented in [Build.md](Build.md).
 
 For a plain line-by-line terminal instead:
 

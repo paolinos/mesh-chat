@@ -6,12 +6,12 @@ mod worker;
 use std::{
     error::Error,
     fs::{self, OpenOptions},
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 
 use libp2p::identity::Keypair;
 use tokio::sync::mpsc;
@@ -20,6 +20,16 @@ use tracing_subscriber::EnvFilter;
 const DATA_DIR: &str = "data";
 const IDENTITY_FILE: &str = "identity.key";
 const LOG_FILE: &str = "chat.log";
+
+/// Create a file with owner-only permissions from the start (no write-then-chmod window).
+fn write_new_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)
+}
 
 /// Load the ed25519 key from `path`, creating it on first run.
 /// The file is authoritative for the PeerId; the database row comes in phase 3.
@@ -35,9 +45,7 @@ fn load_or_create_identity(path: &Path) -> io::Result<Keypair> {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(path, bytes)?;
-            #[cfg(unix)]
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            write_new_private(path, &bytes)?;
             Ok(keypair)
         }
         Err(error) => Err(error),
@@ -86,7 +94,11 @@ fn print_usage() {
 }
 
 fn init_logging(path: &Path) -> io::Result<()> {
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
     tracing_subscriber::fmt()
         .with_writer(file)
         .with_env_filter(
