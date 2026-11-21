@@ -82,6 +82,26 @@ mod tests {
     }
 
     #[test]
+    fn group_requests_round_trip() {
+        let invite = ChatRequest::GroupInvite {
+            group_id: "g-1".to_string(),
+            group_name: "team".to_string(),
+            invited_by: "peer-a".to_string(),
+        };
+        let bytes = serde_json::to_vec(&invite).unwrap();
+        assert_eq!(serde_json::from_slice::<ChatRequest>(&bytes).unwrap(), invite);
+
+        let member = ChatRequest::MemberAdded {
+            group_id: "g-1".to_string(),
+            peer_id: "peer-b".to_string(),
+            username: "bob".to_string(),
+            invited_by: "peer-a".to_string(),
+        };
+        let bytes = serde_json::to_vec(&member).unwrap();
+        assert_eq!(serde_json::from_slice::<ChatRequest>(&bytes).unwrap(), member);
+    }
+
+    #[test]
     fn responses_and_presence_round_trip() {
         let ack = ChatResponse::Ack {
             outbox_id: None,

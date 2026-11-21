@@ -44,7 +44,7 @@ fn load_or_create_identity(path: &Path) -> io::Result<Keypair> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Cli {
-    Run(PathBuf),
+    Run { data_dir: PathBuf, simple: bool },
     Help,
     Error(String),
 }
@@ -55,6 +55,7 @@ where
 {
     let mut args = args.into_iter().skip(1);
     let mut data_dir = PathBuf::from(DATA_DIR);
+    let mut simple = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -62,17 +63,19 @@ where
                 Some(path) => data_dir = PathBuf::from(path),
                 None => return Cli::Error("--data-dir requires a path".to_string()),
             },
+            "--simple" => simple = true,
             "-h" | "--help" => return Cli::Help,
             other => return Cli::Error(format!("unknown argument: {other}")),
         }
     }
-    Cli::Run(data_dir)
+    Cli::Run { data_dir, simple }
 }
 
 fn print_usage() {
-    println!("Usage: lan-chat [--data-dir DIR]");
+    println!("Usage: lan-chat [--data-dir DIR] [--simple]");
     println!();
     println!("  --data-dir DIR  where identity.key (and later chat.db) live; default: data");
+    println!("  --simple        plain line-by-line CLI instead of the full-screen TUI");
     println!("  -h, --help      show this help");
     println!();
     println!("Run two instances on one laptop with separate data dirs, e.g.");
@@ -94,8 +97,8 @@ fn init_logging(path: &Path) -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let data_dir = match parse_args_from(std::env::args()) {
-        Cli::Run(dir) => dir,
+    let (data_dir, simple) = match parse_args_from(std::env::args()) {
+        Cli::Run { data_dir, simple } => (data_dir, simple),
         Cli::Help => {
             print_usage();
             return Ok(());
@@ -117,12 +120,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (event_tx, event_rx) = mpsc::channel(128);
     let network = network::spawn(keypair, username.clone(), command_rx, event_tx)?;
 
-    println!(
-        "Identity: {} (saved in {})",
-        network.peer_id,
-        identity_path.display()
+    tracing::info!(
+        peer_id = %network.peer_id,
+        identity = %identity_path.display(),
+        "identity loaded"
     );
-    ui::cli::run(network.peer_id, username, command_tx, event_rx).await?;
+    if simple {
+        println!(
+            "Identity: {} (saved in {})",
+            network.peer_id,
+            identity_path.display()
+        );
+        ui::cli::run(network.peer_id, username, command_tx, event_rx).await?;
+    } else {
+        ui::run(network.peer_id, username, command_tx, event_rx).await?;
+    }
 
     if tokio::time::timeout(Duration::from_secs(2), network.task)
         .await
@@ -159,15 +171,22 @@ mod tests {
     fn parses_data_dir_argument() {
         assert_eq!(
             parse_args_from(["lan-chat".to_string()]),
-            Cli::Run(PathBuf::from(DATA_DIR))
+            Cli::Run {
+                data_dir: PathBuf::from(DATA_DIR),
+                simple: false,
+            }
         );
         assert_eq!(
             parse_args_from([
                 "lan-chat".to_string(),
                 "--data-dir".to_string(),
                 "data/alice".to_string(),
+                "--simple".to_string(),
             ]),
-            Cli::Run(PathBuf::from("data/alice"))
+            Cli::Run {
+                data_dir: PathBuf::from("data/alice"),
+                simple: true,
+            }
         );
         assert_eq!(
             parse_args_from(["lan-chat".to_string(), "--help".to_string()]),

@@ -10,7 +10,8 @@ use std::{
 
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identity::Keypair, mdns, request_response,
+    gossipsub, identity::Keypair, mdns,
+    request_response::{self, OutboundRequestId},
     swarm::{Swarm, SwarmEvent},
     Multiaddr, PeerId,
 };
@@ -28,7 +29,13 @@ use self::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkCommand {
+    /// Phase-1 CLI fallback: broadcast to every connected peer.
     SendChat { message: ChatMessage },
+    /// Send one request to each explicit recipient (chat, invite, member update).
+    SendDirect {
+        request: ChatRequest,
+        recipients: Vec<PeerId>,
+    },
     Shutdown,
 }
 
@@ -62,6 +69,26 @@ pub enum NetworkEvent {
     },
     MessageReceived {
         message: ChatMessage,
+    },
+    /// Phase-2 ACK correlation, keyed by message id (no database yet).
+    MessageAck {
+        message_id: String,
+        peer_id: PeerId,
+        ok: bool,
+        error: Option<String>,
+    },
+    GroupInviteReceived {
+        from: PeerId,
+        group_id: String,
+        group_name: String,
+        invited_by: String,
+    },
+    MemberAddedReceived {
+        from: PeerId,
+        group_id: String,
+        peer_id: PeerId,
+        username: String,
+        invited_by: String,
     },
     /// Used from phase 3 to update the outbox after a delivery attempt.
     DeliveryReport {
@@ -127,6 +154,8 @@ async fn run_loop(
     let mut connected = HashSet::new();
     let mut announced = HashSet::new();
     let mut known_usernames: HashMap<PeerId, String> = HashMap::new();
+    // Outbound request id -> (message id, recipient), used to clear `(Pending)`.
+    let mut pending_requests: HashMap<OutboundRequestId, (String, PeerId)> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -135,20 +164,26 @@ async fn run_loop(
                 if command.is_shutdown() {
                     break;
                 }
-                if let NetworkCommand::SendChat { message } = command {
-                    let recipients = recipients_for(&NetworkCommand::SendChat { message: message.clone() }, &connected);
-                    if recipients.is_empty() {
-                        let _ = event_tx.send(NetworkEvent::Error {
-                            message: "no connected peers to send to".to_string(),
-                        }).await;
-                        continue;
+                let recipients = match &command {
+                    NetworkCommand::SendChat { .. } => {
+                        recipients_for(&command, &connected)
                     }
-                    for peer in recipients {
-                        swarm.behaviour_mut().request_response.send_request(
-                            &peer,
-                            ChatRequest::Chat(message.clone()),
-                        );
-                    }
+                    NetworkCommand::SendDirect { recipients, .. } => recipients.clone(),
+                    NetworkCommand::Shutdown => Vec::new(),
+                };
+                if recipients.is_empty() {
+                    let _ = event_tx.send(NetworkEvent::Error {
+                        message: "no connected peers to send to".to_string(),
+                    }).await;
+                    continue;
+                }
+                for peer in recipients {
+                    let request = match &command {
+                        NetworkCommand::SendChat { message } => ChatRequest::Chat(message.clone()),
+                        NetworkCommand::SendDirect { request, .. } => request.clone(),
+                        NetworkCommand::Shutdown => unreachable!(),
+                    };
+                    send_request(&mut swarm, &mut pending_requests, peer, request);
                 }
             }
             event = swarm.next() => {
@@ -236,16 +271,38 @@ async fn run_loop(
                                     ChatResponse::Ack { outbox_id: None, ok: true, error: None },
                                 );
                             }
-                            // Group events arrive in phase 2; ack them so peers do not stall.
-                            ChatRequest::GroupInvite { .. } | ChatRequest::MemberAdded { .. } => {
-                                debug!(peer = %short_peer_id(&peer), "received future group event");
+                            ChatRequest::GroupInvite { group_id, group_name, invited_by } => {
+                                let _ = event_tx.send(NetworkEvent::GroupInviteReceived {
+                                    from: peer,
+                                    group_id,
+                                    group_name,
+                                    invited_by,
+                                }).await;
+                                let _ = swarm.behaviour_mut().request_response.send_response(
+                                    channel,
+                                    ChatResponse::Ack { outbox_id: None, ok: true, error: None },
+                                );
+                            }
+                            ChatRequest::MemberAdded { group_id, peer_id, username, invited_by } => {
+                                match peer_id.parse::<PeerId>() {
+                                    Ok(added) => {
+                                        let _ = event_tx.send(NetworkEvent::MemberAddedReceived {
+                                            from: peer,
+                                            group_id,
+                                            peer_id: added,
+                                            username,
+                                            invited_by,
+                                        }).await;
+                                    }
+                                    Err(error) => debug!(%error, "ignoring member_added with bad peer id"),
+                                }
                                 let _ = swarm.behaviour_mut().request_response.send_response(
                                     channel,
                                     ChatResponse::Ack { outbox_id: None, ok: true, error: None },
                                 );
                             }
                         },
-                        request_response::Message::Response { response, .. } => match response {
+                        request_response::Message::Response { request_id, response, .. } => match response {
                             ChatResponse::HelloAck { username } => {
                                 known_usernames.insert(peer, username.clone());
                                 if announced.insert(peer) {
@@ -256,20 +313,39 @@ async fn run_loop(
                                 }
                             }
                             ChatResponse::Ack { outbox_id: Some(outbox_id), ok, error } => {
+                                pending_requests.remove(&request_id);
                                 let _ = event_tx.send(NetworkEvent::DeliveryReport {
                                     outbox_id,
                                     ok,
                                     error,
                                 }).await;
                             }
-                            ChatResponse::Ack { outbox_id: None, .. } => {}
+                            ChatResponse::Ack { outbox_id: None, ok, error } => {
+                                if let Some((message_id, peer_id)) = pending_requests.remove(&request_id) {
+                                    debug!(%message_id, peer = %short_peer_id(&peer_id), ok, "chat ack");
+                                    let _ = event_tx.send(NetworkEvent::MessageAck {
+                                        message_id,
+                                        peer_id,
+                                        ok,
+                                        error,
+                                    }).await;
+                                }
+                            }
                         },
                     },
                     SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(
-                        request_response::Event::OutboundFailure { peer, error, .. },
+                        request_response::Event::OutboundFailure { peer, request_id, error, .. },
                     )) => {
+                        if let Some((message_id, peer_id)) = pending_requests.remove(&request_id) {
+                            let _ = event_tx.send(NetworkEvent::MessageAck {
+                                message_id,
+                                peer_id,
+                                ok: false,
+                                error: Some(error.to_string()),
+                            }).await;
+                        }
                         let _ = event_tx.send(NetworkEvent::Error {
-                            message: format!("request to {} failed: {error:?}", short_peer_id(&peer)),
+                            message: format!("request to {} failed: {error}", short_peer_id(&peer)),
                         }).await;
                     }
                     SwarmEvent::Behaviour(ChatBehaviourEvent::RequestResponse(
@@ -329,6 +405,26 @@ async fn run_loop(
     debug!("network task stopped");
 }
 
+/// Send one request and remember chat requests so their ACK can clear `(Pending)`.
+fn send_request(
+    swarm: &mut Swarm<ChatBehaviour>,
+    pending_requests: &mut HashMap<OutboundRequestId, (String, PeerId)>,
+    peer: PeerId,
+    request: ChatRequest,
+) {
+    let message_id = match &request {
+        ChatRequest::Chat(message) => Some(message.id.clone()),
+        _ => None,
+    };
+    let request_id = swarm
+        .behaviour_mut()
+        .request_response
+        .send_request(&peer, request);
+    if let Some(message_id) = message_id {
+        pending_requests.insert(request_id, (message_id, peer));
+    }
+}
+
 fn publish_presence(
     swarm: &mut Swarm<ChatBehaviour>,
     local_peer_id: PeerId,
@@ -357,11 +453,18 @@ fn publish_presence(
     }
 }
 
-/// Deterministic recipient list for a command (broadcast to all connected peers in phase 1).
+/// Deterministic recipient list: phase 1 broadcasts, phase 2 uses explicit recipients.
 fn recipients_for(command: &NetworkCommand, connected: &HashSet<PeerId>) -> Vec<PeerId> {
     match command {
         NetworkCommand::SendChat { .. } => {
             let mut peers: Vec<PeerId> = connected.iter().copied().collect();
+            peers.sort_by_key(|peer| peer.to_string());
+            peers
+        }
+        NetworkCommand::SendDirect { recipients, .. } => {
+            // Keep offline recipients too: the resulting failure becomes a MessageAck so the
+            // UI can keep the line marked `(Pending)` until phase 3 retries it.
+            let mut peers = recipients.clone();
             peers.sort_by_key(|peer| peer.to_string());
             peers
         }
@@ -393,6 +496,52 @@ mod tests {
         assert_eq!(recipients.len(), 2);
         assert!(recipients.contains(&a));
         assert!(recipients.contains(&b));
+    }
+
+    #[test]
+    fn send_direct_uses_explicit_recipients_even_when_offline() {
+        let a = PeerId::random();
+        let offline = PeerId::random();
+        let connected = HashSet::from([a]);
+        let command = NetworkCommand::SendDirect {
+            request: ChatRequest::Chat(message()),
+            recipients: vec![a, offline],
+        };
+        let mut expected = vec![a, offline];
+        expected.sort_by_key(|peer| peer.to_string());
+        assert_eq!(recipients_for(&command, &connected), expected);
+    }
+
+    #[test]
+    fn group_events_carry_the_sender_and_payload() {
+        let from = PeerId::random();
+        let added = PeerId::random();
+        let invite = NetworkEvent::GroupInviteReceived {
+            from,
+            group_id: "g1".to_string(),
+            group_name: "team".to_string(),
+            invited_by: from.to_string(),
+        };
+        match invite {
+            NetworkEvent::GroupInviteReceived { group_name, .. } => {
+                assert_eq!(group_name, "team")
+            }
+            _ => panic!("wrong event"),
+        }
+        let member = NetworkEvent::MemberAddedReceived {
+            from,
+            group_id: "g1".to_string(),
+            peer_id: added,
+            username: "bob".to_string(),
+            invited_by: from.to_string(),
+        };
+        match member {
+            NetworkEvent::MemberAddedReceived { peer_id, username, .. } => {
+                assert_eq!(peer_id, added);
+                assert_eq!(username, "bob");
+            }
+            _ => panic!("wrong event"),
+        }
     }
 
     #[test]

@@ -122,7 +122,10 @@ pub fn format_event(event: &NetworkEvent) -> Option<String> {
         NetworkEvent::Error { message } => Some(format!("! {message}")),
         NetworkEvent::PeerDiscovered { .. }
         | NetworkEvent::PeerExpired { .. }
-        | NetworkEvent::DeliveryReport { .. } => None,
+        | NetworkEvent::DeliveryReport { .. }
+        | NetworkEvent::MessageAck { .. }
+        | NetworkEvent::GroupInviteReceived { .. }
+        | NetworkEvent::MemberAddedReceived { .. } => None,
     }
 }
 

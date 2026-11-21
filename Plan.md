@@ -9,6 +9,9 @@ messages to offline peers wait until those peers come back.
 The project is built incrementally in **3 phases**. Each phase leaves the app working; phase 2
 replaces the plain CLI with a TUI, phase 3 adds persistence without changing the UI contract.
 
+**Status:** Phases 1 and 2 are implemented and verified (`make test`: 40 passing tests); phase 3 is
+pending. The phase 1 UI is still available as `--simple`.
+
 ---
 
 ## Decisions confirmed with the user
@@ -218,7 +221,8 @@ struct Presence { peer_id: String, username: String, online: bool }
 
 - Protocol string `/p2p-chat/1.0.0`; max request size ~1 MiB.
 - `Ack` carries an `outbox_id` so delivery updates are exact even with group fan-out. It is `None`
-  in phase 1 (no database yet) and `Some(id)` from phase 3.
+  in phase 1/2 (no database yet) and `Some(id)` from phase 3. In phases 1/2 the UI correlates
+  `Ack { outbox_id: None }` with the libp2p `OutboundRequestId` of the chat request.
 - Incoming `ChatMessage.id` is deduplicated (`INSERT OR IGNORE` in phase 3, `HashSet` in phase 2).
 
 ---
