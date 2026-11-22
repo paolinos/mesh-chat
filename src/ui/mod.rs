@@ -11,7 +11,7 @@ pub mod render;
 
 use std::{error::Error, time::Duration};
 
-use crossterm::event::{poll, read, Event};
+use crossterm::event::{poll, read, Event, MouseEventKind};
 use libp2p::PeerId;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -20,8 +20,21 @@ use crate::{
     worker::{Store, WorkerEvent},
 };
 
-use app::{make_message, App, GENERAL};
+use app::{make_message, App, AttachmentView, GENERAL};
 use input::{Action, InputResult};
+
+fn resolve_attachment_path(path: &str) -> Option<std::path::PathBuf> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(rest))?
+    } else {
+        std::path::PathBuf::from(path)
+    };
+    expanded.canonicalize().ok().or_else(|| expanded.exists().then_some(expanded))
+}
 
 fn handle_network_event(app: &mut App, event: NetworkEvent, store: Option<&Store>) {
     if let Some(store) = store {
@@ -127,10 +140,23 @@ async fn send_message(
         app.system("No one to send to yet — wait for a peer to come online.");
         return;
     }
+    let attachment_paths = std::mem::take(&mut app.pending_attachments);
+    let attachment_views: Vec<_> = attachment_paths
+        .iter()
+        .map(|path| AttachmentView {
+            filename: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file")
+                .to_string(),
+            display_path: path.to_string_lossy().to_string(),
+            open_path: path.to_string_lossy().to_string(),
+        })
+        .collect();
     let message = make_message(&me, username, channel, body);
     let message_id = message.id.clone();
-    app.record_outgoing(message.clone(), recipients.clone());
-    if let Err(error) = store.save_outgoing(message, recipients).await {
+    app.record_outgoing(message.clone(), recipients.clone(), attachment_views);
+    if let Err(error) = store.save_outgoing(message, recipients, attachment_paths).await {
         app.set_message_pending(&message_id, false);
         app.system(format!("! message was not saved: {error}"));
     }
@@ -157,6 +183,30 @@ pub async fn handle_action(
             }
             Err(error) => app.system(error.to_string()),
         },
+        Action::AttachFile { path } => {
+            if !app.active_conversation.starts_with("dm:") {
+                app.system("Files can only be attached in direct messages.");
+                return;
+            }
+            match resolve_attachment_path(&path) {
+                Some(absolute) => {
+                    if absolute.exists() {
+                        let name = absolute
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("file")
+                            .to_string();
+                        app.add_pending_attachment(absolute);
+                        app.system(format!(
+                            "📎 Attached '{name}'. Type a caption and press Enter."
+                        ));
+                    } else {
+                        app.system(format!("! file not found: {path}"));
+                    }
+                }
+                None => app.system(format!("! invalid file path: {path}")),
+            }
+        }
         Action::Users => {
             let summary = app.users_summary();
             app.system(summary);
@@ -250,6 +300,20 @@ fn apply_worker_event(app: &mut App<'_>, event: WorkerEvent) {
         WorkerEvent::DeliveryFailed { error, .. } => {
             app.system(format!("! delivery failed: {error} (still pending)"));
         }
+        WorkerEvent::AttachmentsStored {
+            message_id,
+            attachments,
+        } => {
+            let views: Vec<_> = attachments
+                .into_iter()
+                .map(|a| AttachmentView {
+                    filename: a.filename,
+                    display_path: a.local_path.clone(),
+                    open_path: a.local_path,
+                })
+                .collect();
+            app.update_attachments(&message_id, views);
+        }
     }
 }
 
@@ -277,14 +341,28 @@ async fn tui_loop(
                     apply_worker_event(app, event);
                 }
                 while poll(Duration::ZERO)? {
-                    if let Event::Key(key) = read()? {
-                        match input::handle_key(app, key) {
+                    match read()? {
+                        Event::Key(key) => match input::handle_key(app, key) {
                             InputResult::Quit => return Ok(()),
                             InputResult::Redraw => {}
                             InputResult::Action(action) => {
                                 handle_action(app, me, username, action, store).await;
                             }
+                        },
+                        Event::Mouse(mouse) => {
+                            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                                if let Some(path) = app.attachment_at(mouse.column, mouse.row) {
+                                    let path = path.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Err(error) = crate::files::open_with_os(path.as_ref())
+                                        {
+                                            tracing::warn!(%error, "could not open attachment");
+                                        }
+                                    });
+                                }
+                            }
                         }
+                        _ => {}
                     }
                 }
             }
@@ -398,7 +476,7 @@ mod tests {
     fn failed_ack_keeps_message_pending() {
         let mut app = fixture();
         let peer = *app.peers.keys().next().unwrap();
-        app.record_outgoing(message(GENERAL), vec![peer]);
+        app.record_outgoing(message(GENERAL), vec![peer], Vec::new());
         assert!(app.is_pending("m1"));
         handle_network_event(
             &mut app,

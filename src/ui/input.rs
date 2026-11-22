@@ -4,7 +4,7 @@ use ratatui_textarea::Input;
 use super::app::{App, Selection};
 use super::complete::{unique_prefix, COMMANDS, GROUP_SUBCOMMANDS};
 
-pub const HELP: &str = "Commands: /users [name] [message], /group create <name>, /group add <group> <user>, /group members <group>, /help, /quit. Tab completes commands and names.";
+pub const HELP: &str = "Commands: /users [name] [message], /file <path>, /attach <path>, /group create <name>, /group add <group> <user>, /group members <group>, /help, /quit. Tab completes commands and names.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -12,6 +12,7 @@ pub enum Command {
     Chat(String),
     Users,
     Dm { user: String, body: String },
+    File { path: String },
     GroupCreate(String),
     GroupAdd { group: String, user: String },
     GroupMembers(String),
@@ -23,6 +24,7 @@ pub enum Command {
 pub enum Action {
     SendChat(String),
     SendDm { user: String, body: String },
+    AttachFile { path: String },
     Users,
     GroupCreate(String),
     GroupAdd { group: String, user: String },
@@ -68,6 +70,16 @@ pub fn parse_input(line: &str) -> Command {
     }
     if first == "/users" {
         return Command::Users;
+    }
+    if let Some(path) = first.strip_prefix("/file ") {
+        return Command::File {
+            path: path.trim().to_string(),
+        };
+    }
+    if let Some(path) = first.strip_prefix("/attach ") {
+        return Command::File {
+            path: path.trim().to_string(),
+        };
     }
     if let Some(args) = first.strip_prefix("/users ") {
         let mut parts = args.trim().splitn(2, char::is_whitespace);
@@ -125,6 +137,7 @@ fn command_to_action(command: Command) -> InputResult {
         Command::Quit => InputResult::Quit,
         Command::Users => InputResult::Action(Action::Users),
         Command::Dm { user, body } => InputResult::Action(Action::SendDm { user, body }),
+        Command::File { path } => InputResult::Action(Action::AttachFile { path }),
         Command::GroupCreate(name) => InputResult::Action(Action::GroupCreate(name)),
         Command::GroupAdd { group, user } => InputResult::Action(Action::GroupAdd { group, user }),
         Command::GroupMembers(group) => InputResult::Action(Action::GroupMembers(group)),
@@ -290,6 +303,23 @@ mod tests {
         );
         assert_eq!(parse_input("/group add bob"), Command::Help);
         assert_eq!(parse_input("/group create"), Command::Help);
+    }
+
+    #[test]
+    fn parses_file_and_attach_commands() {
+        assert_eq!(
+            parse_input("/file /tmp/report.pdf"),
+            Command::File {
+                path: "/tmp/report.pdf".to_string()
+            }
+        );
+        assert_eq!(
+            parse_input("/attach ~/notes.txt"),
+            Command::File {
+                path: "~/notes.txt".to_string()
+            }
+        );
+        assert_eq!(parse_input("/file"), Command::Help);
     }
 
     #[test]

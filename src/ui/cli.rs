@@ -128,7 +128,11 @@ pub fn format_event(event: &NetworkEvent) -> Option<String> {
                 Ok(peer_id) => display_name(&message.from_username, &peer_id),
                 Err(_) => message.from_username.clone(),
             };
-            Some(format!("<{label}> {}", message.body))
+            let mut text = format!("<{label}> {}", message.body);
+            for attachment in &message.attachments {
+                text.push_str(&format!(" [📎 {}]", attachment.filename));
+            }
+            Some(text)
         }
         NetworkEvent::Error { message } => Some(format!("! {message}")),
         NetworkEvent::PeerDiscovered { .. }

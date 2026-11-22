@@ -2,9 +2,11 @@
 
 A serverless, peer-to-peer chat for the terminal. Peers find each other on the local network with **mDNS**, exchange usernames and messages over direct **Noise-encrypted libp2p** connections, and use gossipsub only for presence. There is no central server and no account to create.
 
-History, group memberships and undelivered messages are kept in a local SQLite database, so messages to offline peers stay pending, survive restarts, and are retried with exponential backoff when those peers come back online.
+History, group memberships and undelivered messages are kept in a local SQLite database, so messages to offline peers stay pending, survive restarts, and are retried with exponential backoff when those peers come back online. You can also send files over the same encrypted direct channels.
 
 > **Current scope:** peers must be on the same local network. mDNS uses multicast UDP 5353 and requires a shared L2 broadcast domain; VPNs, Docker bridge networks and Wi-Fi client isolation usually block it. Connecting to peers outside the local network is not implemented yet.
+>
+> **File sharing scope:** files can be attached to direct messages only (not `#general` or private groups). Each attachment is sent inline inside the encrypted direct message, with a 15 MB per-message limit.
 
 ## Running it
 
@@ -52,10 +54,11 @@ Each directory gets its own `identity.key`, `chat.db` and `chat.log`. Peers shou
 ### Using the TUI
 
 - `Enter` sends the current input; `Shift+Enter` inserts a newline.
-- `Tab` completes what you are typing: slash commands, `/group` subcommands, usernames after `/users` or `/group add`, and group names. A hint appears under the input; `Esc` dismisses it. Unambiguous prefixes such as `/u` or `/g cr` also work when you press `Enter`, without completing first.
+- `Tab` completes what you are typing: slash commands, `/group` subcommands, usernames after `/users` or `/group add`, group names, and file paths after `/file` or `/attach`. A hint appears under the input; `Esc` dismisses it. Unambiguous prefixes such as `/u` or `/g cr` also work when you press `Enter`, without completing first.
 - `↑`/`↓` select a channel or group; `Enter` or `Tab` switches to it; `Esc` returns focus to the input. Typing any character also returns focus to the input.
 - `/quit`, `/exit` or `Ctrl+C` exits and restores the terminal.
 - Incoming messages in a conversation you are not viewing add a yellow `●` to its label in `CHANNELS`/`GROUPS` and in the header tabs. Opening the conversation clears it, even after a restart: unread conversations (with first/last unread timestamps) are stored in SQLite and the row is deleted once read.
+- Mouse support is enabled in the TUI: click an attachment line (`📎 filename → path`) to open it with the OS default application.
 
 The complete `/u` → Tab → username → Tab → send flow is covered end to end in `src/ui/autocomplete_tests.rs`; the unread-marker flow is covered in `src/ui/unread_tests.rs`.
 
@@ -63,12 +66,26 @@ The complete `/u` → Tab → username → Tab → send flow is covered end to e
 | --- | --- |
 | `/users` | Print known peers in the chat panel |
 | `/users <name> <body…>` | Send a direct message; body may be multiline |
+| `/file <path>` | Attach a file to the next direct message (use `Tab` to complete the path) |
+| `/attach <path>` | Alias for `/file <path>` |
 | `/group create <name>` | Create a private group; only you see it at first |
 | `/group add <group> <name>` | Invite a user; any member can invite more users |
 | `/group members <group>` | List current members of a group |
 | `/help` | Show short command help |
 
 Plain text goes to the active conversation: `#general` (everyone online), a direct-message thread, or a private group. Every chat line has a local `HH:MM` timestamp. A send to an offline recipient shows `(Pending)` until it is acknowledged; retries run at 1 s, 2 s, 4 s … capped at 5 minutes, and nothing is dropped.
+
+### Sending files
+
+Files can only be attached to direct messages:
+
+1. Switch to a DM channel (or use `/users <name> <body…>`).
+2. Type `/file <path>` (or `/attach <path>`). Press `Tab` to complete the path.
+3. A hint shows the attached file. Type an optional caption and press `Enter`.
+
+The sender sees the original absolute path, so clicking it opens the source file. The receiver's copy is saved under `data/downloads/<YYYYMMDD>_<username>_<filename>` and opened by the OS when clicked.
+
+Total attachments per message are capped at 15 MB. Filenames are sanitized and collisions are deduplicated with a numeric suffix.
 
 Usernames are labels, so each peer is shown as `name·<last4 of PeerId>`. Connected peers and their messages are green, offline or unknown senders are gray, and your own messages are green.
 
@@ -77,7 +94,8 @@ Usernames are labels, so each peer is shown as `name·<last4 of PeerId>`. Connec
 With the default `--data-dir data`:
 
 - `data/identity.key` — ed25519 private key (mode `0600` on Unix). The PeerId stays the same across restarts; delete the file to get a new identity.
-- `data/chat.db` — SQLite database (WAL mode) holding peers, messages, group memberships and outbox rows.
+- `data/chat.db` — SQLite database (WAL mode) holding peers, messages, group memberships, outbox rows and file attachment metadata.
+- `data/downloads/` — files received from other users, named `<YYYYMMDD>_<username>_<filename>`.
 - `data/chat.log` — tracing output. Logs go to a file so the terminal stays clean. Set `RUST_LOG=debug` for verbose diagnostics.
 
 ## Architecture
@@ -107,6 +125,7 @@ The outbox stores one row per (message, recipient), so group fan-out is acknowle
 ### Folder structure
 
 - `src/main.rs` — CLI arguments, identity loading, logging and wiring between the UI, network and database worker.
+- `src/files.rs` — downloads folder management, filename sanitization/deduplication and OS file opening.
 - `src/network/`
   - `mod.rs` — swarm task, network commands/events, peer map and direct sends with ACK correlation.
   - `behaviour.rs` — mDNS, identify, request-response and gossipsub composition.
@@ -131,6 +150,7 @@ The outbox stores one row per (message, recipient), so group fan-out is acknowle
 - Full-screen terminal UI with multiline input, command/username autocompletion, channels, direct messages, stable per-peer colors and `(Pending)` state; a plain `--simple` CLI is also available.
 - Private invite-only groups with chain invites: any member can invite more members, and member lists converge across all existing members. Non-members never see group names or messages.
 - Local SQLite persistence: history, peers, group memberships and an outbox with exponential-backoff retries and offline flushing on reconnect.
+- File sharing in direct messages: attach files with `/file` or `/attach`, store received files in `data/downloads/`, render them as clickable attachment lines, and open them with the OS default application.
 - Unit tests across all modules (`make test`).
 
 ## What is missing

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     io,
     time::{SystemTime, UNIX_EPOCH},
@@ -6,6 +7,7 @@ use std::{
 
 use crossterm::{
     cursor::{Hide, Show},
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -33,6 +35,22 @@ pub struct Peer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentView {
+    pub filename: String,
+    pub display_path: String,
+    pub open_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentHitArea {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub open_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatLine {
     Message {
         id: String,
@@ -41,6 +59,7 @@ pub enum ChatLine {
         body: String,
         created_at: i64,
         mine: bool,
+        attachments: Vec<AttachmentView>,
     },
     System(String),
 }
@@ -84,7 +103,12 @@ impl TerminalGuard {
     pub fn new() -> io::Result<Self> {
         enable_raw_mode()?;
         let guard = TerminalGuard;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            Hide
+        ) {
             guard.restore();
             return Err(error);
         }
@@ -92,7 +116,7 @@ impl TerminalGuard {
     }
 
     fn restore(&self) {
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -184,6 +208,10 @@ pub struct App<'a> {
     /// message id -> peers whose ACK has not arrived yet.
     pending: HashMap<String, HashSet<PeerId>>,
     seen_messages: HashSet<String>,
+    /// Paths queued by `/file` or `/attach` to be sent with the next message.
+    pub pending_attachments: Vec<std::path::PathBuf>,
+    /// Screen rectangles for clickable attachments in the current frame.
+    pub attachment_hit_areas: RefCell<Vec<AttachmentHitArea>>,
 }
 
 impl<'a> App<'a> {
@@ -208,6 +236,8 @@ impl<'a> App<'a> {
             dismissed_completion: None,
             pending: HashMap::new(),
             seen_messages: HashSet::new(),
+            pending_attachments: Vec::new(),
+            attachment_hit_areas: RefCell::new(Vec::new()),
         }
     }
 
@@ -248,6 +278,32 @@ impl<'a> App<'a> {
         self.dismissed_completion = None;
         self.refresh_completion();
         true
+    }
+
+    fn attachment_views_from_stored(
+        attachments: Vec<crate::database::StoredAttachment>,
+    ) -> Vec<AttachmentView> {
+        attachments
+            .into_iter()
+            .map(|a| AttachmentView {
+                filename: a.filename,
+                display_path: a.local_path.clone(),
+                open_path: a.local_path,
+            })
+            .collect()
+    }
+
+    fn attachment_views_from_wire(
+        attachments: Vec<crate::network::protocol::Attachment>,
+    ) -> Vec<AttachmentView> {
+        attachments
+            .into_iter()
+            .map(|a| AttachmentView {
+                filename: a.filename,
+                display_path: "(saving...)".to_string(),
+                open_path: String::new(),
+            })
+            .collect()
     }
 
     /// Fill the TUI from SQLite on startup without re-broadcasting presence from old messages.
@@ -304,6 +360,7 @@ impl<'a> App<'a> {
                     body: message.body,
                     created_at: message.created_at,
                     mine,
+                    attachments: Self::attachment_views_from_stored(message.attachments),
                 },
             );
         }
@@ -460,6 +517,7 @@ impl<'a> App<'a> {
                 body: message.body,
                 created_at: message.created_at,
                 mine: false,
+                attachments: Self::attachment_views_from_wire(message.attachments),
             },
         );
         // Messages in the conversation the user is looking at are read immediately.
@@ -471,7 +529,12 @@ impl<'a> App<'a> {
         Some(key)
     }
 
-    pub fn record_outgoing(&mut self, message: ChatMessage, recipients: Vec<PeerId>) {
+    pub fn record_outgoing(
+        &mut self,
+        message: ChatMessage,
+        recipients: Vec<PeerId>,
+        attachments: Vec<AttachmentView>,
+    ) {
         self.seen_messages.insert(message.id.clone());
         let key = message.channel.clone();
         self.ensure_conversation(&key);
@@ -484,6 +547,7 @@ impl<'a> App<'a> {
                 body: message.body,
                 created_at: message.created_at,
                 mine: true,
+                attachments,
             },
         );
         self.mark_pending(&message.id, recipients);
@@ -508,6 +572,43 @@ impl<'a> App<'a> {
 
     pub fn is_pending(&self, message_id: &str) -> bool {
         self.pending.contains_key(message_id)
+    }
+
+    pub fn add_pending_attachment(&mut self, path: std::path::PathBuf) {
+        self.pending_attachments.push(path);
+    }
+
+    /// Find the attachment path under the given screen coordinates, if any.
+    pub fn attachment_at(&self, x: u16, y: u16) -> Option<String> {
+        for area in self.attachment_hit_areas.borrow().iter() {
+            if x >= area.x
+                && x < area.x + area.width
+                && y >= area.y
+                && y < area.y + area.height
+            {
+                return Some(area.open_path.clone());
+            }
+        }
+        None
+    }
+
+    /// Update attachment paths after the worker has stored incoming files.
+    pub fn update_attachments(&mut self, message_id: &str, attachments: Vec<AttachmentView>) {
+        for lines in self.conversations.values_mut() {
+            for line in lines {
+                if let ChatLine::Message {
+                    id,
+                    attachments: existing,
+                    ..
+                } = line
+                {
+                    if id == message_id {
+                        *existing = attachments;
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// `#general` is always visible; DMs are canonicalized by `record_incoming`, and group
@@ -1063,5 +1164,61 @@ mod tests {
         assert_eq!(app.peers[&peer_b()].color, color);
         assert_eq!(app.peers[&peer_b()].username, "bobby");
         assert!(!app.peers[&peer_b()].online);
+    }
+
+    #[test]
+    fn pending_attachments_are_added_and_rendered_with_message() {
+        let mut app = App::new(peer_a(), "alice".to_string());
+        app.add_pending_attachment(std::path::PathBuf::from("/tmp/photo.png"));
+        assert_eq!(app.pending_attachments.len(), 1);
+    }
+
+    #[test]
+    fn attachment_hit_areas_are_clickable() {
+        let app = App::new(peer_a(), "alice".to_string());
+        app.attachment_hit_areas.borrow_mut().push(AttachmentHitArea {
+            x: 10,
+            y: 5,
+            width: 8,
+            height: 1,
+            open_path: "/tmp/file.txt".to_string(),
+        });
+        assert_eq!(app.attachment_at(10, 5), Some("/tmp/file.txt".to_string()));
+        assert_eq!(app.attachment_at(9, 5), None);
+        assert_eq!(app.attachment_at(18, 5), None);
+    }
+
+    #[test]
+    fn update_attachments_replaces_placeholder_paths() {
+        let me = peer_a();
+        let bob = peer_b();
+        let mut app = App::new(me, "alice".to_string());
+        app.add_or_update_peer(bob, "bob", true);
+        let dm = format!("dm:{bob}");
+        app.activate_conversation(&dm);
+
+        let mut message = make_message(&bob, "bob", dm.clone(), "see attached".to_string());
+        message.id = "m1".to_string();
+        message.attachments = vec![crate::network::protocol::Attachment {
+            filename: "note.txt".to_string(),
+            bytes: Vec::new(),
+            mime_type: None,
+        }];
+        app.record_incoming(message);
+
+        app.update_attachments(
+            "m1",
+            vec![AttachmentView {
+                filename: "note.txt".to_string(),
+                display_path: "data/downloads/20250101_bob_note.txt".to_string(),
+                open_path: "data/downloads/20250101_bob_note.txt".to_string(),
+            }],
+        );
+
+        if let ChatLine::Message { attachments, .. } = &app.conversations[&dm][0] {
+            assert_eq!(attachments[0].display_path, "data/downloads/20250101_bob_note.txt");
+        } else {
+            panic!("expected message line");
+        }
     }
 }

@@ -1,5 +1,6 @@
 use std::{
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
     sync::{mpsc as std_mpsc, Arc},
     time::{Duration, Instant},
 };
@@ -12,9 +13,10 @@ use tokio::{
 use tracing::warn;
 
 use crate::{
-    database::{Database, History},
+    database::{Database, History, OutboxRow, StoredAttachment},
+    files::{self, store_incoming_file},
     network::{
-        protocol::{ChatMessage, ChatRequest},
+        protocol::{Attachment, ChatMessage, ChatRequest},
         NetworkCommand, NetworkEvent,
     },
 };
@@ -30,6 +32,7 @@ pub enum WorkerCommand {
     SaveOutgoing {
         message: ChatMessage,
         recipients: Vec<PeerId>,
+        attachment_paths: Vec<PathBuf>,
         reply: Reply<()>,
     },
     CreateGroup {
@@ -88,6 +91,10 @@ pub enum WorkerEvent {
         outbox_id: u64,
         error: String,
     },
+    AttachmentsStored {
+        message_id: String,
+        attachments: Vec<StoredAttachment>,
+    },
 }
 
 #[derive(Clone)]
@@ -108,6 +115,7 @@ pub struct WorkerHandle {
 impl Store {
     pub fn spawn(
         db_path: &Path,
+        data_dir: PathBuf,
         me: PeerId,
         username: String,
         network_tx: mpsc::Sender<NetworkCommand>,
@@ -119,7 +127,7 @@ impl Store {
         let (command_tx, command_rx) = std_mpsc::channel::<WorkerCommand>();
         let (event_tx, events) = mpsc::unbounded_channel::<WorkerEvent>();
         let task = tokio::task::spawn_blocking(move || {
-            worker_loop(database, me, username, command_rx, network_tx, event_tx)
+            worker_loop(database, data_dir, me, username, command_rx, network_tx, event_tx)
         });
         Ok((
             Self {
@@ -149,10 +157,12 @@ impl Store {
         &self,
         message: ChatMessage,
         recipients: Vec<PeerId>,
+        attachment_paths: Vec<PathBuf>,
     ) -> Result<(), String> {
         self.call(|reply| WorkerCommand::SaveOutgoing {
             message,
             recipients,
+            attachment_paths,
             reply,
         })
         .await
@@ -283,6 +293,7 @@ impl Store {
 
 fn worker_loop(
     mut database: Database,
+    data_dir: PathBuf,
     me: PeerId,
     username: String,
     commands: std_mpsc::Receiver<WorkerCommand>,
@@ -297,6 +308,7 @@ fn worker_loop(
             Ok(command) => {
                 let should_poll = match handle_command(
                     &mut database,
+                    &data_dir,
                     &me,
                     &username,
                     command,
@@ -325,6 +337,7 @@ fn worker_loop(
 
 fn handle_command(
     database: &mut Database,
+    data_dir: &Path,
     me: &PeerId,
     username: &str,
     command: WorkerCommand,
@@ -340,12 +353,18 @@ fn handle_command(
         WorkerCommand::SaveOutgoing {
             message,
             recipients,
+            attachment_paths,
             reply,
         } => {
-            let result = database
-                .save_outgoing(&message, &recipients, &[])
-                .map(|_| ())
-                .map_err(|error| error.to_string());
+            let result = save_outgoing_with_attachments(
+                database,
+                data_dir,
+                &message,
+                &recipients,
+                &attachment_paths,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string());
             let _ = reply.send(result);
             poll_now = true;
         }
@@ -382,10 +401,22 @@ fn handle_command(
             conversation,
             unread,
         } => {
+            let attachments = match store_incoming_attachments(data_dir, &message) {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    warn!(%error, "could not store incoming attachments");
+                    Vec::new()
+                }
+            };
             if let Err(error) =
-                database.insert_incoming_message(&message, &conversation, unread, &[])
+                database.insert_incoming_message(&message, &conversation, unread, &attachments)
             {
                 warn!(%error, "could not store incoming message");
+            } else if !attachments.is_empty() {
+                let _ = event_tx.send(WorkerEvent::AttachmentsStored {
+                    message_id: message.id,
+                    attachments,
+                });
             }
         }
         WorkerCommand::MarkConversationRead { channel } => {
@@ -464,6 +495,90 @@ fn handle_command(
         WorkerCommand::Shutdown => {}
     }
     Ok(poll_now)
+}
+
+fn save_outgoing_with_attachments(
+    database: &mut Database,
+    _data_dir: &Path,
+    message: &ChatMessage,
+    recipients: &[PeerId],
+    attachment_paths: &[PathBuf],
+) -> Result<Vec<OutboxRow>, String> {
+    let (wire_attachments, stored_attachments) = read_source_attachments(attachment_paths)?;
+    let mut message = message.clone();
+    message.attachments = wire_attachments;
+    // The sender sees the absolute source path of the original file, not a copy.
+    database
+        .save_outgoing(&message, recipients, &stored_attachments)
+        .map_err(|error| error.to_string())
+}
+
+fn read_source_attachments(
+    paths: &[PathBuf],
+) -> Result<(Vec<Attachment>, Vec<StoredAttachment>), String> {
+    let mut wire = Vec::new();
+    let mut stored = Vec::new();
+    let mut total: usize = 0;
+    for path in paths {
+        let bytes = fs::read(path).map_err(|error| {
+            format!("could not read attachment {}: {error}", path.display())
+        })?;
+        let size = bytes.len();
+        total = total.checked_add(size).ok_or("attachment size overflow")?;
+        if total > files::MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "attachments exceed {} MB limit",
+                files::MAX_ATTACHMENT_BYTES / (1024 * 1024)
+            ));
+        }
+        let absolute = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        let filename = absolute
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        wire.push(Attachment {
+            filename: filename.clone(),
+            bytes,
+            mime_type: None,
+        });
+        stored.push(StoredAttachment {
+            filename,
+            local_path: absolute.to_string_lossy().to_string(),
+            size_bytes: size as i64,
+            is_sender: true,
+        });
+    }
+    Ok((wire, stored))
+}
+
+fn store_incoming_attachments(
+    data_dir: &Path,
+    message: &ChatMessage,
+) -> Result<Vec<StoredAttachment>, String> {
+    let mut stored = Vec::new();
+    for attachment in &message.attachments {
+        let path = store_incoming_file(
+            data_dir,
+            message.created_at,
+            &message.from_username,
+            &attachment.filename,
+            &attachment.bytes,
+        )
+        .map_err(|error| {
+            format!(
+                "could not store incoming attachment {}: {error}",
+                attachment.filename
+            )
+        })?;
+        stored.push(StoredAttachment {
+            filename: attachment.filename.clone(),
+            local_path: path.to_string_lossy().to_string(),
+            size_bytes: attachment.bytes.len() as i64,
+            is_sender: false,
+        });
+    }
+    Ok(stored)
 }
 
 fn poll_due(
@@ -546,6 +661,7 @@ mod tests {
         let (network_tx, network_rx) = mpsc::channel(16);
         let (store, handle) = Store::spawn(
             &dir.path().join("chat.db"),
+            dir.path().to_path_buf(),
             alice(),
             "alice".to_string(),
             network_tx,
@@ -580,7 +696,7 @@ mod tests {
         let mut fixture = fixture();
         fixture
             .store
-            .save_outgoing(message("m1", "#general"), vec![bob()])
+            .save_outgoing(message("m1", "#general"), vec![bob()], Vec::new())
             .await
             .unwrap();
         assert!(timeout(Duration::from_millis(150), fixture.network_rx.recv())
@@ -685,15 +801,22 @@ mod tests {
             .unwrap();
         fixture
             .store
-            .save_outgoing(message("m1", "#general"), vec![bob()])
+            .save_outgoing(message("m1", "#general"), vec![bob()], Vec::new())
             .await
             .unwrap();
 
         let db_path = fixture.dir.path().join("chat.db");
+        let data_dir = fixture.dir.path().to_path_buf();
         let _dir = fixture.stop().await;
         let (network_tx, _network_rx) = mpsc::channel(4);
-        let (store, handle) =
-            Store::spawn(&db_path, alice(), "alice".to_string(), network_tx).unwrap();
+        let (store, handle) = Store::spawn(
+            &db_path,
+            data_dir,
+            alice(),
+            "alice".to_string(),
+            network_tx,
+        )
+        .unwrap();
         let history = store.load_history().await.unwrap();
         assert!(history.messages.iter().any(|item| item.id == "m1"));
         assert!(history.groups.iter().any(|group| group.id == "g1"));
@@ -733,6 +856,92 @@ mod tests {
         let history = fixture.store.load_history().await.unwrap();
         assert_eq!(history.messages.len(), 1);
         assert!(history.unread.is_empty());
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn outgoing_attachment_uses_absolute_source_path() {
+        let mut fixture = fixture();
+        let source_path = fixture.dir.path().join("source.txt");
+        fs::write(&source_path, b"payload").unwrap();
+        let dm = format!("dm:{}", bob());
+
+        fixture
+            .store
+            .save_outgoing(
+                message("m1", &dm),
+                vec![bob()],
+                vec![source_path.clone()],
+            )
+            .await
+            .unwrap();
+
+        let history = fixture.store.load_history().await.unwrap();
+        let stored = history.messages.iter().find(|item| item.id == "m1").unwrap();
+        assert_eq!(stored.attachments.len(), 1);
+        assert_eq!(stored.attachments[0].filename, "source.txt");
+        assert_eq!(
+            stored.attachments[0].local_path,
+            source_path.canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(stored.attachments[0].is_sender);
+
+        // Bob must be online before the outbox row is claimed.
+        fixture.store.observe_network_event(&NetworkEvent::Presence {
+            peer_id: bob(),
+            username: "bob".to_string(),
+            online: true,
+        });
+
+        // The queued network payload should carry the bytes.
+        let command = next_command(&mut fixture.network_rx).await;
+        let NetworkCommand::SendDirect { request, .. } = command else {
+            panic!("wrong command");
+        };
+        let ChatRequest::Chat(queued) = request else {
+            panic!("wrong request");
+        };
+        assert_eq!(queued.attachments.len(), 1);
+        assert_eq!(queued.attachments[0].bytes, b"payload");
+
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn incoming_attachment_is_stored_in_downloads() {
+        let fixture = fixture();
+        let dm = format!("dm:{}", bob());
+        let mut incoming = ChatMessage {
+            from_peer: bob().to_string(),
+            from_username: "bob".to_string(),
+            attachments: vec![Attachment {
+                filename: "note.txt".to_string(),
+                bytes: b"hello".to_vec(),
+                mime_type: None,
+            }],
+            ..message("m1", "dm:me")
+        };
+        incoming.created_at = 1_735_689_600_000;
+
+        fixture.store.record_incoming_message(&incoming, &dm, true);
+        let history = fixture.store.load_history().await.unwrap();
+        let stored = history.messages.iter().find(|item| item.id == "m1").unwrap();
+        assert_eq!(stored.attachments.len(), 1);
+        assert_eq!(stored.attachments[0].filename, "note.txt");
+        assert!(
+            stored.attachments[0]
+                .local_path
+                .contains("downloads/20250101_bob_note.txt"),
+            "got {}",
+            stored.attachments[0].local_path
+        );
+        assert!(!stored.attachments[0].is_sender);
+        assert!(Path::new(&stored.attachments[0].local_path).exists());
+        assert_eq!(
+            fs::read(&stored.attachments[0].local_path).unwrap(),
+            b"hello"
+        );
+
         fixture.stop().await;
     }
 

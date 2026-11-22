@@ -286,7 +286,6 @@ impl Database {
             )?;
             let request = ChatRequest::Chat(ChatMessage {
                 outbox_id: Some(id),
-                attachments: Vec::new(),
                 ..message.clone()
             });
             set_outbox_payload(&tx, id, &request)?;

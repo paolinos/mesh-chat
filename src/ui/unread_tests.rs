@@ -143,6 +143,7 @@ mod scenario_tests {
         let (network_tx, _network_rx) = tokio::sync::mpsc::channel(4);
         let (store, handle) = Store::spawn(
             &dir.path().join("chat.db"),
+            dir.path().to_path_buf(),
             PeerId::random(),
             "alice".to_string(),
             network_tx,

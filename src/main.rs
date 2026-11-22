@@ -1,4 +1,5 @@
 mod database;
+mod files;
 mod network;
 mod ui;
 mod worker;
@@ -144,6 +145,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // presence flushes the outbox even while the TUI is redrawing.
     let (store, worker) = worker::Store::spawn(
         &data_dir.join("chat.db"),
+        data_dir.clone(),
         network.peer_id,
         username.clone(),
         command_tx.clone(),

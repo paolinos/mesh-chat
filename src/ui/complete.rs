@@ -3,7 +3,15 @@ use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 use super::app::App;
 
 /// Top-level commands offered by the TUI. Kept here so parsing and completion agree.
-pub const COMMANDS: &[&str] = &["/users", "/group", "/help", "/quit", "/exit"];
+pub const COMMANDS: &[&str] = &[
+    "/users",
+    "/group",
+    "/file",
+    "/attach",
+    "/help",
+    "/quit",
+    "/exit",
+];
 pub const GROUP_SUBCOMMANDS: &[&str] = &["create", "add", "members"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +105,63 @@ fn group_values(app: &App) -> Vec<(String, String)> {
     values
 }
 
+fn path_values(prefix: &str) -> Vec<(String, String)> {
+    let expanded = if let Some(rest) = prefix.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join(rest))
+            .unwrap_or_else(|| std::path::PathBuf::from(prefix))
+    } else {
+        std::path::PathBuf::from(prefix)
+    };
+
+    let (dir, partial) = if prefix.ends_with('/') {
+        (expanded.clone(), String::new())
+    } else {
+        let partial = expanded
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        let dir = expanded
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        (dir, partial)
+    };
+
+    let mut values: Vec<(String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !partial.is_empty()
+                && !name.to_lowercase().starts_with(&partial.to_lowercase())
+            {
+                continue;
+            }
+            let full = if prefix.ends_with('/') {
+                format!("{}{}", expanded.to_string_lossy(), name)
+            } else {
+                format!("{}/{}", dir.to_string_lossy(), name)
+            };
+            let is_dir = path.is_dir();
+            let value = if is_dir {
+                format!("{}/", full)
+            } else {
+                full
+            };
+            let label = if is_dir {
+                format!("{}/", name)
+            } else {
+                name
+            };
+            values.push((value, label));
+        }
+    }
+    values.sort_by(|a, b| a.1.cmp(&b.1));
+    values
+}
+
 /// Work out what the caret is currently typing. Only the first input line can hold a command;
 /// later lines are the (free-form) message body.
 pub fn find_completion(app: &App) -> Option<Completion> {
@@ -136,6 +201,7 @@ pub fn find_completion(app: &App) -> Option<Completion> {
         (0, _, _) => build_completion(prefix, command_values()),
         (1, "/group", _) => build_completion(prefix, subcommand_values()),
         (1, "/users", _) => build_completion(prefix, username_values(app)),
+        (1, "/file", _) | (1, "/attach", _) => build_completion(prefix, path_values(prefix)),
         (2, "/group", Some("add")) | (2, "/group", Some("members")) => {
             build_completion(prefix, group_values(app))
         }
@@ -161,7 +227,10 @@ pub fn apply_candidate(
         .get(row)
         .map(|line| line.chars().count())
         .unwrap_or(0);
-    let insert = if col == line_len && !candidate.value.ends_with(char::is_whitespace) {
+    let insert = if col == line_len
+        && !candidate.value.ends_with(char::is_whitespace)
+        && !candidate.value.ends_with('/')
+    {
         format!("{} ", candidate.value)
     } else {
         candidate.value.clone()
@@ -209,6 +278,10 @@ mod tests {
 
         let completion = type_and_complete(&mut app, "/").unwrap();
         assert_eq!(completion.candidates.len(), COMMANDS.len());
+        assert!(completion
+            .candidates
+            .iter()
+            .any(|candidate| candidate.value == "/file"));
     }
 
     #[test]
@@ -238,6 +311,29 @@ mod tests {
         assert_eq!(completion.candidates[0].value, "team");
 
         assert!(type_and_complete(&mut app, "/users bob hello").is_none());
+    }
+
+    #[test]
+    fn completes_file_paths() {
+        let (mut app, _, _) = app_with_peers();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("report.pdf"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+
+        let path = dir.path().to_string_lossy();
+        let completion = type_and_complete(&mut app, &format!("/file {path}/")).unwrap();
+        assert!(completion
+            .candidates
+            .iter()
+            .any(|candidate| candidate.value == format!("{path}/report.pdf")));
+        assert!(completion
+            .candidates
+            .iter()
+            .any(|candidate| candidate.value == format!("{path}/docs/")));
+
+        let completion = type_and_complete(&mut app, &format!("/file {path}/rep")).unwrap();
+        assert_eq!(completion.candidates.len(), 1);
+        assert_eq!(completion.candidates[0].value, format!("{path}/report.pdf"));
     }
 
     #[test]

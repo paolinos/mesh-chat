@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{App, ChatLine, Selection, GENERAL, OWN_COLOR};
+use super::app::{App, AttachmentHitArea, ChatLine, Selection, GENERAL, OWN_COLOR};
 
 /// Render a stored epoch-millisecond timestamp as local `HH:MM`.
 /// Falls back to UTC if the platform cannot determine the local offset.
@@ -164,10 +164,37 @@ fn completion_hint(app: &App) -> Option<Line<'static>> {
     Some(Line::from(spans))
 }
 
-fn chat_lines(app: &App) -> Vec<Line<'static>> {
+/// Hint showing files queued by `/file` or `/attach`.
+fn attachment_hint(app: &App) -> Option<Line<'static>> {
+    if app.pending_attachments.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = app
+        .pending_attachments
+        .iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+        })
+        .collect();
+    Some(Line::from(vec![
+        Span::styled("📎 ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            names.join(", "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" attached — press Enter to send", Style::default().fg(Color::DarkGray)),
+    ]))
+}
+
+fn chat_lines(app: &App) -> (Vec<Line<'static>>, Vec<(usize, AttachmentHitArea)>) {
     let mut rendered = Vec::new();
+    let mut attachment_areas = Vec::new();
     let Some(lines) = app.conversations.get(&app.active_conversation) else {
-        return rendered;
+        return (rendered, attachment_areas);
     };
 
     for line in lines {
@@ -185,6 +212,7 @@ fn chat_lines(app: &App) -> Vec<Line<'static>> {
                 body,
                 created_at,
                 mine,
+                attachments,
             } => {
                 // A live (online) sender is green, matching their green channel label;
                 // offline or unknown senders are gray.
@@ -228,10 +256,28 @@ fn chat_lines(app: &App) -> Vec<Line<'static>> {
                     }
                     rendered.push(rendered_line);
                 }
+                for attachment in attachments {
+                    let text = format!("📎 {} → {}", attachment.filename, attachment.display_path);
+                    let width = text.chars().count() as u16;
+                    attachment_areas.push((
+                        rendered.len(),
+                        AttachmentHitArea {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height: 1,
+                            open_path: attachment.open_path.clone(),
+                        },
+                    ));
+                    rendered.push(Line::from(Span::styled(
+                        text,
+                        Style::default().fg(Color::Cyan),
+                    )));
+                }
             }
         }
     }
-    rendered
+    (rendered, attachment_areas)
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -249,7 +295,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         groups,
     );
 
-    let hint = completion_hint(app);
+    let completion = completion_hint(app);
+    let attachment = attachment_hint(app);
     let input_height: u16 = app
         .textarea
         .lines()
@@ -257,7 +304,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .clamp(3, 10)
         .try_into()
         .unwrap_or(3);
-    let input_height = input_height + u16::from(hint.is_some());
+    let input_height = input_height + u16::from(completion.is_some()) + u16::from(attachment.is_some());
     let [head, chat, input] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -270,18 +317,42 @@ pub fn render(frame: &mut Frame, app: &App) {
     let chat_block = Block::bordered();
     let chat_inner = chat_block.inner(chat);
     frame.render_widget(chat_block, chat);
-    let lines = chat_lines(app);
+    app.attachment_hit_areas.borrow_mut().clear();
+    let (lines, attachment_areas) = chat_lines(app);
     let start = lines.len().saturating_sub(chat_inner.height as usize);
     frame.render_widget(Paragraph::new(lines[start..].to_vec()), chat_inner);
+    for (line_index, mut area) in attachment_areas {
+        let visible_index = line_index.saturating_sub(start);
+        if visible_index >= chat_inner.height as usize {
+            continue;
+        }
+        area.x = chat_inner.x;
+        area.y = chat_inner.y + visible_index as u16;
+        app.attachment_hit_areas.borrow_mut().push(area);
+    }
 
     let input_block = Block::bordered().title("Message (Tab = complete, Shift+Enter = newline)");
     let input_inner = input_block.inner(input);
     frame.render_widget(input_block, input);
-    if hint.is_some() {
-        let [textarea_area, hint_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(input_inner);
-        frame.render_widget(&app.textarea, textarea_area);
-        frame.render_widget(Paragraph::new(hint.unwrap()), hint_area);
+    let hint_count = u16::from(completion.is_some()) + u16::from(attachment.is_some());
+    if hint_count > 0 {
+        let mut constraints = vec![Constraint::Min(1)];
+        if completion.is_some() {
+            constraints.push(Constraint::Length(1));
+        }
+        if attachment.is_some() {
+            constraints.push(Constraint::Length(1));
+        }
+        let areas: Vec<_> = Layout::vertical(constraints).split(input_inner).to_vec();
+        frame.render_widget(&app.textarea, areas[0]);
+        let mut next = 1;
+        if let Some(line) = completion {
+            frame.render_widget(Paragraph::new(line), areas[next]);
+            next += 1;
+        }
+        if let Some(line) = attachment {
+            frame.render_widget(Paragraph::new(line), areas[next]);
+        }
     } else {
         frame.render_widget(&app.textarea, input_inner);
     }
@@ -333,7 +404,7 @@ mod tests {
         let outgoing_message =
             make_message(&me, "alice", GENERAL.to_string(), "hi from me".to_string());
         app.record_incoming(incoming_message.clone());
-        app.record_outgoing(outgoing_message.clone(), vec![bob]);
+        app.record_outgoing(outgoing_message.clone(), vec![bob], Vec::new());
 
         let screen = rendered(&app);
         assert!(!screen.contains("USERS"));
@@ -412,6 +483,36 @@ mod tests {
         assert!(screen.contains("Tab"));
         assert!(screen.contains("bob"));
         assert!(screen.contains("Esc to dismiss"));
+    }
+
+    #[test]
+    fn renders_attachments_with_filename_and_path() {
+        let me: PeerId = "12D3KooWJ2q5Aj9fMZ43AFFz152XxBRQEDBsUo7hHKi4YpYJ4yyB"
+            .parse()
+            .unwrap();
+        let bob = PeerId::random();
+        let mut app = App::new(me, "alice".to_string());
+        app.add_or_update_peer(bob, "bob", true);
+        let dm = format!("dm:{bob}");
+        app.activate_conversation(&dm);
+
+        let mut message = make_message(&bob, "bob", dm.clone(), "see attached".to_string());
+        message.attachments = vec![crate::network::protocol::Attachment {
+            filename: "report.pdf".to_string(),
+            bytes: Vec::new(),
+            mime_type: None,
+        }];
+        app.record_incoming(message);
+
+        app.add_pending_attachment(std::path::PathBuf::from("/tmp/draft.txt"));
+
+        let screen = rendered(&app);
+        assert!(screen.contains("report.pdf"), "attachment filename not found");
+        assert!(screen.contains("(saving...)"), "placeholder path not found");
+        assert!(screen.contains("draft.txt"), "pending attachment hint not found");
+
+        // Hit area is recorded for the rendered attachment.
+        assert!(!app.attachment_hit_areas.borrow().is_empty());
     }
 
     #[test]
