@@ -89,12 +89,20 @@ pub struct StoredGroup {
     pub members: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadConversation {
+    pub channel: String,
+    pub first_unread_at: i64,
+    pub last_unread_at: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct History {
     pub peers: Vec<StoredPeer>,
     pub messages: Vec<StoredMessage>,
     pub groups: Vec<StoredGroup>,
     pub pending_message_ids: HashSet<String>,
+    pub unread: Vec<UnreadConversation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +131,7 @@ impl Database {
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
         )?;
         conn.execute_batch(include_str!("migration/0001_schema.sql"))?;
+        conn.execute_batch(include_str!("migration/0002_unread.sql"))?;
         Ok(Self { conn })
     }
 
@@ -164,18 +173,19 @@ impl Database {
         Ok(())
     }
 
-    /// Store an incoming message once. The UUID is the dedupe key.
-    pub fn insert_incoming_message(&mut self, message: &ChatMessage) -> Result<bool> {
+    /// Store an incoming message once. The UUID is the dedupe key. The unread marker for the
+    /// canonical conversation is written in the same transaction, and removed when the message
+    /// is read immediately.
+    pub fn insert_incoming_message(
+        &mut self,
+        message: &ChatMessage,
+        conversation: &str,
+        unread: bool,
+    ) -> Result<bool> {
         let tx = self.conn.transaction()?;
+        let now = now_millis();
         if let Ok(peer) = message.from_peer.parse::<PeerId>() {
-            upsert_peer(
-                &tx,
-                &peer,
-                &message.from_username,
-                true,
-                false,
-                now_millis(),
-            )?;
+            upsert_peer(&tx, &peer, &message.from_username, true, false, now)?;
         }
         let changed = tx.execute(
             "INSERT OR IGNORE INTO messages
@@ -190,8 +200,30 @@ impl Database {
                 message.created_at
             ],
         )?;
+        if unread && changed > 0 {
+            tx.execute(
+                "INSERT INTO unread_conversations (channel, first_unread_at, last_unread_at)
+                 VALUES (?1, ?2, ?2)
+                 ON CONFLICT(channel) DO UPDATE SET last_unread_at = excluded.last_unread_at",
+                params![conversation, now],
+            )?;
+        } else if !unread {
+            tx.execute(
+                "DELETE FROM unread_conversations WHERE channel = ?1",
+                params![conversation],
+            )?;
+        }
         tx.commit()?;
         Ok(changed > 0)
+    }
+
+    /// Forget that a conversation has unread messages. Called when the user opens it.
+    pub fn clear_unread(&mut self, conversation: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM unread_conversations WHERE channel = ?1",
+            params![conversation],
+        )?;
+        Ok(())
     }
 
     /// Insert one outgoing message row and one outbox row per recipient in a single transaction.
@@ -545,6 +577,22 @@ impl Database {
         for id in pending_rows {
             history.pending_message_ids.insert(id?);
         }
+        drop(pending);
+
+        let mut unread = self.conn.prepare(
+            "SELECT channel, first_unread_at, last_unread_at FROM unread_conversations
+             ORDER BY last_unread_at, channel",
+        )?;
+        let unread_rows = unread.query_map([], |row| {
+            Ok(UnreadConversation {
+                channel: row.get(0)?,
+                first_unread_at: row.get(1)?,
+                last_unread_at: row.get(2)?,
+            })
+        })?;
+        for row in unread_rows {
+            history.unread.push(row?);
+        }
         Ok(history)
     }
 }
@@ -734,6 +782,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table, "outbox");
+        let unread_table: String = database
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'unread_conversations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unread_table, "unread_conversations");
         let history = database.history().unwrap();
         assert_eq!(history.peers.len(), 1);
         assert!(history.peers[0].is_local);
@@ -773,12 +830,76 @@ mod tests {
             from_username: "bob".to_string(),
             ..message("m1", "#general")
         };
-        assert!(database.insert_incoming_message(&incoming).unwrap());
-        assert!(!database.insert_incoming_message(&incoming).unwrap());
+        assert!(database
+            .insert_incoming_message(&incoming, "#general", true)
+            .unwrap());
+        let history = database.history().unwrap();
+        assert_eq!(history.unread.len(), 1);
+        assert_eq!(history.unread[0].channel, "#general");
+        assert!(!database
+            .insert_incoming_message(&incoming, "#general", true)
+            .unwrap());
         let history = database.history().unwrap();
         assert_eq!(history.messages.len(), 1);
         assert_eq!(history.messages[0].direction, "in");
+        // A duplicate message must not create a second marker or change the first timestamp.
+        assert_eq!(history.unread.len(), 1);
+        assert_eq!(history.unread[0].first_unread_at, history.unread[0].last_unread_at);
         assert!(history.peers.iter().any(|peer| peer.peer_id == bob().to_string() && peer.online));
+    }
+
+    #[test]
+    fn unread_conversations_keep_receive_dates_and_are_cleared_on_read() {
+        let (_dir, mut database) = db();
+        let first = ChatMessage {
+            from_peer: bob().to_string(),
+            from_username: "bob".to_string(),
+            ..message("m1", "dm:me")
+        };
+        let second = ChatMessage {
+            id: "m2".to_string(),
+            created_at: 20,
+            ..first.clone()
+        };
+
+        assert!(database
+            .insert_incoming_message(&first, "dm:bob", true)
+            .unwrap());
+        let history = database.history().unwrap();
+        assert_eq!(history.unread.len(), 1);
+        let first_row = &history.unread[0];
+        assert_eq!(first_row.channel, "dm:bob");
+        assert_eq!(first_row.first_unread_at, first_row.last_unread_at);
+        let initial_first = first_row.first_unread_at;
+
+        assert!(database
+            .insert_incoming_message(&second, "dm:bob", true)
+            .unwrap());
+        let history = database.history().unwrap();
+        assert_eq!(history.unread.len(), 1);
+        assert_eq!(history.unread[0].first_unread_at, initial_first);
+        assert!(history.unread[0].last_unread_at >= initial_first);
+
+        // A message in the open conversation removes any leftover marker in the same transaction.
+        let third = ChatMessage {
+            id: "m3".to_string(),
+            ..first.clone()
+        };
+        assert!(database
+            .insert_incoming_message(&third, "dm:bob", false)
+            .unwrap());
+        assert!(database.history().unwrap().unread.is_empty());
+
+        let fourth = ChatMessage {
+            id: "m4".to_string(),
+            ..first.clone()
+        };
+        assert!(database
+            .insert_incoming_message(&fourth, "dm:bob", true)
+            .unwrap());
+        assert_eq!(database.history().unwrap().unread.len(), 1);
+        database.clear_unread("dm:bob").unwrap();
+        assert!(database.history().unwrap().unread.is_empty());
     }
 
     #[test]

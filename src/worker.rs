@@ -45,7 +45,12 @@ pub enum WorkerCommand {
         existing: Vec<PeerId>,
         reply: Reply<()>,
     },
-    IncomingMessage { message: ChatMessage },
+    IncomingMessage {
+        message: ChatMessage,
+        conversation: String,
+        unread: bool,
+    },
+    MarkConversationRead { channel: String },
     PeerOnline {
         peer_id: PeerId,
         username: String,
@@ -178,7 +183,29 @@ impl Store {
         .await
     }
 
-    /// Mirror network presence/message/group events into the database. Never blocks the UI.
+    /// Store an incoming message together with its unread marker. The UI supplies the canonical
+    /// conversation key and whether it is already open. Never blocks the UI.
+    pub fn record_incoming_message(
+        &self,
+        message: &ChatMessage,
+        conversation: &str,
+        unread: bool,
+    ) {
+        let _ = self.commands.tx.send(WorkerCommand::IncomingMessage {
+            message: message.clone(),
+            conversation: conversation.to_string(),
+            unread,
+        });
+    }
+
+    /// Forget unread state when the user opens a conversation. Never blocks the UI.
+    pub fn mark_conversation_read(&self, channel: &str) {
+        let _ = self.commands.tx.send(WorkerCommand::MarkConversationRead {
+            channel: channel.to_string(),
+        });
+    }
+
+    /// Mirror network presence/group events into the database. Never blocks the UI.
     pub fn observe_network_event(&self, event: &NetworkEvent) {
         let command = match event {
             NetworkEvent::PeerConnected { peer_id, username }
@@ -207,9 +234,6 @@ impl Store {
             NetworkEvent::PeerExpired { peer_id } => Some(WorkerCommand::PeerOffline {
                 peer_id: *peer_id,
                 username: None,
-            }),
-            NetworkEvent::MessageReceived { message } => Some(WorkerCommand::IncomingMessage {
-                message: message.clone(),
             }),
             NetworkEvent::GroupInviteReceived {
                 from,
@@ -240,7 +264,10 @@ impl Store {
                 ok: *ok,
                 error: error.clone(),
             }),
-            NetworkEvent::PeerDiscovered { .. }
+            // Incoming messages are stored by `record_incoming_message`, which also knows the
+            // canonical conversation key and whether the user is already reading it.
+            NetworkEvent::MessageReceived { .. }
+            | NetworkEvent::PeerDiscovered { .. }
             | NetworkEvent::MessageAck { .. }
             | NetworkEvent::Error { .. } => None,
         };
@@ -350,9 +377,20 @@ fn handle_command(
             let _ = reply.send(result);
             poll_now = true;
         }
-        WorkerCommand::IncomingMessage { message } => {
-            if let Err(error) = database.insert_incoming_message(&message) {
+        WorkerCommand::IncomingMessage {
+            message,
+            conversation,
+            unread,
+        } => {
+            if let Err(error) =
+                database.insert_incoming_message(&message, &conversation, unread)
+            {
                 warn!(%error, "could not store incoming message");
+            }
+        }
+        WorkerCommand::MarkConversationRead { channel } => {
+            if let Err(error) = database.clear_unread(&channel) {
+                warn!(%error, "could not clear unread marker");
             }
         }
         WorkerCommand::PeerOnline { peer_id, username } => {
@@ -661,6 +699,40 @@ mod tests {
         assert!(history.pending_message_ids.contains("m1"));
         store.shutdown();
         let _ = timeout(Duration::from_secs(2), handle.task).await;
+    }
+
+    #[tokio::test]
+    async fn incoming_message_and_unread_marker_follow_store_commands() {
+        let fixture = fixture();
+        let dm = format!("dm:{}", bob());
+        let incoming = ChatMessage {
+            from_peer: bob().to_string(),
+            from_username: "bob".to_string(),
+            ..message("m1", "dm:me")
+        };
+
+        // `observe_network_event` must not store messages: the UI supplies the canonical key and
+        // the read state, so only `record_incoming_message` writes them.
+        fixture.store.observe_network_event(&NetworkEvent::MessageReceived {
+            message: incoming.clone(),
+        });
+        let history = fixture.store.load_history().await.unwrap();
+        assert!(history.messages.is_empty());
+        assert!(history.unread.is_empty());
+
+        fixture
+            .store
+            .record_incoming_message(&incoming, &dm, true);
+        let history = fixture.store.load_history().await.unwrap();
+        assert!(history.messages.iter().any(|item| item.id == "m1"));
+        assert_eq!(history.unread.len(), 1);
+        assert_eq!(history.unread[0].channel, dm);
+
+        fixture.store.mark_conversation_read(&dm);
+        let history = fixture.store.load_history().await.unwrap();
+        assert_eq!(history.messages.len(), 1);
+        assert!(history.unread.is_empty());
+        fixture.stop().await;
     }
 
     #[test]

@@ -41,6 +41,20 @@ fn peer_style(app: &App, peer_id: &libp2p::PeerId, active: bool) -> Style {
     style
 }
 
+/// A yellow bullet on the right of a conversation label means unread messages.
+fn unread_bullet(app: &App, key: &str) -> Span<'static> {
+    if app.has_unread(key) {
+        Span::styled(
+            " ●",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("")
+    }
+}
+
 fn channels_list(app: &App) -> Vec<ListItem<'static>> {
     app.channel_keys()
         .into_iter()
@@ -50,16 +64,22 @@ fn channels_list(app: &App) -> Vec<ListItem<'static>> {
                 && index == app.channel_selection)
                 || app.active_conversation == key;
             if key == GENERAL {
-                Some(ListItem::new(key).style(selected(active)))
+                Some(ListItem::new(Line::from(vec![
+                    Span::styled(key.clone(), selected(active)),
+                    unread_bullet(app, &key),
+                ])))
             } else {
                 let peer_id = key
                     .strip_prefix("dm:")?
                     .parse::<libp2p::PeerId>()
                     .ok()?;
-                Some(
-                    ListItem::new(format!("DM {}", app.peer_label(&peer_id)))
-                        .style(peer_style(app, &peer_id, active)),
-                )
+                Some(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("DM {}", app.peer_label(&peer_id)),
+                        peer_style(app, &peer_id, active),
+                    ),
+                    unread_bullet(app, &key),
+                ])))
             }
         })
         .collect()
@@ -70,10 +90,12 @@ fn groups_list(app: &App) -> Vec<ListItem<'static>> {
         .iter()
         .enumerate()
         .map(|(index, group)| {
-            ListItem::new(format!("🔒 {}", group.name)).style(selected(
-                (app.selection == Selection::Groups && index == app.group_selection)
-                    || app.active_conversation == group.id,
-            ))
+            let active = (app.selection == Selection::Groups && index == app.group_selection)
+                || app.active_conversation == group.id;
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("🔒 {}", group.name), selected(active)),
+                unread_bullet(app, &group.id),
+            ]))
         })
         .collect()
 }
@@ -105,6 +127,7 @@ fn header(app: &App) -> Line<'static> {
             Style::default().fg(Color::DarkGray)
         };
         spans.push(Span::styled(label, style));
+        spans.push(unread_bullet(app, key));
     }
     Line::from(spans)
 }
@@ -335,6 +358,46 @@ mod tests {
         assert!(outgoing_col > 55, "own text should be right aligned");
 
         assert!(app.group(&group_id).is_some());
+    }
+
+    #[test]
+    fn unread_bullets_appear_on_dm_and_group_labels() {
+        let me: PeerId = "12D3KooWJ2q5Aj9fMZ43AFFz152XxBRQEDBsUo7hHKi4YpYJ4yyB"
+            .parse()
+            .unwrap();
+        let bob = PeerId::random();
+        let mut app = App::new(me, "alice".to_string());
+        app.add_or_update_peer(bob, "bob", true);
+        let dm = format!("dm:{bob}");
+        let group_id = app.create_group("team");
+
+        app.record_incoming(make_message(&bob, "bob", dm.clone(), "dm unread".to_string()));
+        app.record_incoming(make_message(
+            &bob,
+            "bob",
+            group_id.clone(),
+            "group unread".to_string(),
+        ));
+
+        let screen = rendered(&app);
+        assert!(screen
+            .lines()
+            .any(|line| line.contains("DM bob") && line.contains('●')));
+        assert!(screen
+            .lines()
+            .any(|line| line.contains("team") && line.contains('●')));
+
+        app.activate_conversation(&dm);
+        let screen = rendered(&app);
+        // Check the panel row itself: the header is one line shared by all conversations.
+        let dm_row = screen
+            .lines()
+            .find(|line| line.starts_with("│DM bob"))
+            .unwrap();
+        assert!(!dm_row.contains('●'));
+        assert!(screen
+            .lines()
+            .any(|line| line.contains("team") && line.contains('●')));
     }
 
     #[test]

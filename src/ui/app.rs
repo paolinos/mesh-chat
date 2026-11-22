@@ -174,6 +174,8 @@ pub struct App<'a> {
     pub channel_selection: usize,
     pub group_selection: usize,
     pub textarea: tui_textarea::TextArea<'a>,
+    /// Conversations with messages that arrived while they were not open.
+    unread: HashSet<String>,
     /// Suggestions for the token under the caret, shown in the input panel.
     pub completion: Option<Completion>,
     /// Prefix the user explicitly dismissed with Esc; stays quiet until the token changes.
@@ -200,6 +202,7 @@ impl<'a> App<'a> {
             channel_selection: 0,
             group_selection: 0,
             textarea,
+            unread: HashSet::new(),
             completion: None,
             dismissed_completion: None,
             pending: HashMap::new(),
@@ -306,6 +309,12 @@ impl<'a> App<'a> {
         for id in history.pending_message_ids {
             self.pending.entry(id).or_default();
         }
+        // The conversation shown on startup is already open, so it is read immediately.
+        for unread in history.unread {
+            if unread.channel != self.active_conversation {
+                self.unread.insert(unread.channel);
+            }
+        }
     }
 
     pub fn set_message_pending(&mut self, message_id: &str, pending: bool) {
@@ -388,11 +397,17 @@ impl<'a> App<'a> {
     pub fn activate_conversation(&mut self, key: &str) {
         self.ensure_conversation(key);
         self.active_conversation = key.to_string();
+        // Opening a conversation marks its pending messages as read.
+        self.unread.remove(key);
         self.group_selection = self
             .groups
             .iter()
             .position(|group| group.id == key)
             .unwrap_or(self.group_selection);
+    }
+
+    pub fn has_unread(&self, key: &str) -> bool {
+        self.unread.contains(key)
     }
 
     pub fn system(&mut self, text: impl Into<String>) {
@@ -410,10 +425,11 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Returns false for a duplicate, an unparseable DM sender, or a group we are not in.
-    pub fn record_incoming(&mut self, message: ChatMessage) -> bool {
+    /// Returns the canonical conversation key for a newly recorded message, or `None` for a
+    /// duplicate, an unparseable DM sender, or a group we are not in.
+    pub fn record_incoming(&mut self, message: ChatMessage) -> Option<String> {
         if !self.seen_messages.insert(message.id.clone()) {
-            return false;
+            return None;
         }
         let peer = message.from_peer.parse::<PeerId>().ok();
         // Any incoming message proves the sender is connected, including a `#general` broadcast.
@@ -426,12 +442,12 @@ impl<'a> App<'a> {
             // peer used. This keeps every DM in `dm:<peer_id>` instead of creating stray threads.
             match peer {
                 Some(peer) => format!("dm:{peer}"),
-                None => return false,
+                None => return None,
             }
         } else {
             match self.conversation_key_for(&message.channel) {
                 Some(key) => key,
-                None => return false,
+                None => return None,
             }
         };
         self.push_line(
@@ -445,7 +461,13 @@ impl<'a> App<'a> {
                 mine: false,
             },
         );
-        true
+        // Messages in the conversation the user is looking at are read immediately.
+        if key == self.active_conversation {
+            self.unread.remove(&key);
+        } else {
+            self.unread.insert(key.clone());
+        }
+        Some(key)
     }
 
     pub fn record_outgoing(&mut self, message: ChatMessage, recipients: Vec<PeerId>) {
@@ -775,8 +797,12 @@ mod tests {
     #[test]
     fn incoming_messages_are_deduped_and_routed() {
         let mut app = App::new(peer_a(), "alice".to_string());
-        assert!(app.record_incoming(message(GENERAL, "m1", "hello")));
-        assert!(!app.record_incoming(message(GENERAL, "m1", "hello")));
+        assert!(app
+            .record_incoming(message(GENERAL, "m1", "hello"))
+            .is_some());
+        assert!(app
+            .record_incoming(message(GENERAL, "m1", "hello"))
+            .is_none());
         assert_eq!(app.conversations[GENERAL].len(), 1);
         // A broadcast also teaches us who is online, so it is shown in green.
         assert_eq!(app.peers[&peer_b()].username, "bob");
@@ -785,7 +811,9 @@ mod tests {
         // An incoming DM always lands in the canonical `dm:<sender>` thread, even if the
         // sender used a different channel string, and teaches us their username.
         let wrong_channel = format!("dm:{}", peer_a());
-        assert!(app.record_incoming(message(&wrong_channel, "m2", "private")));
+        assert!(app
+            .record_incoming(message(&wrong_channel, "m2", "private"))
+            .is_some());
         let dm_key = format!("dm:{}", peer_b());
         assert_eq!(
             app.conversation_keys(),
@@ -799,18 +827,62 @@ mod tests {
             from_peer: "not-a-peer".to_string(),
             ..message("dm:not-a-peer", "m5", "ignored")
         };
-        assert!(!app.record_incoming(bad_sender));
+        assert!(app.record_incoming(bad_sender).is_none());
         assert_eq!(app.conversation_keys(), vec![GENERAL.to_string(), dm_key]);
 
         let group_id = "secret-group";
-        assert!(!app.record_incoming(message(group_id, "m3", "hidden")));
+        assert!(app
+            .record_incoming(message(group_id, "m3", "hidden"))
+            .is_none());
         app.groups.push(Group {
             id: group_id.to_string(),
             name: "team".to_string(),
             members: HashSet::from([peer_a()]),
         });
-        assert!(app.record_incoming(message(group_id, "m4", "visible")));
+        assert!(app
+            .record_incoming(message(group_id, "m4", "visible"))
+            .is_some());
         assert_eq!(app.conversations[group_id].len(), 1);
+    }
+
+    #[test]
+    fn unread_markers_follow_incoming_messages() {
+        let mut app = App::new(peer_a(), "alice".to_string());
+        let bob = peer_b();
+        let dm = format!("dm:{bob}");
+
+        // A message in the open conversation is read immediately.
+        assert!(app
+            .record_incoming(message(GENERAL, "m1", "hello"))
+            .is_some());
+        assert!(!app.has_unread(GENERAL));
+
+        // Messages that arrive elsewhere stay unread, including duplicates.
+        assert!(app
+            .record_incoming(message(&dm, "m2", "private"))
+            .is_some());
+        assert!(app.has_unread(&dm));
+        assert!(app
+            .record_incoming(message(&dm, "m2", "private"))
+            .is_none());
+        assert!(app.has_unread(&dm));
+
+        let group_id = app.create_group("team");
+        assert!(app
+            .record_incoming(message(&group_id, "m3", "group hi"))
+            .is_some());
+        assert!(app.has_unread(&group_id));
+
+        // Opening a conversation clears only that conversation's marker.
+        app.activate_conversation(&dm);
+        assert!(!app.has_unread(&dm));
+        assert!(app.has_unread(&group_id));
+
+        // New messages in the now-open DM do not become unread.
+        assert!(app
+            .record_incoming(message(&dm, "m4", "again"))
+            .is_some());
+        assert!(!app.has_unread(&dm));
     }
 
     #[test]
@@ -897,7 +969,7 @@ mod tests {
 
     #[test]
     fn history_restores_peers_groups_messages_and_pending_state() {
-        use crate::database::{History, StoredGroup, StoredMessage, StoredPeer};
+        use crate::database::{History, StoredGroup, StoredMessage, StoredPeer, UnreadConversation};
 
         let mut app = App::new(peer_a(), "alice".to_string());
         let carol = PeerId::random();
@@ -946,6 +1018,19 @@ mod tests {
                 members: vec![peer_a().to_string(), peer_b().to_string()],
             }],
             pending_message_ids: HashSet::from(["out-1".to_string()]),
+            unread: vec![
+                UnreadConversation {
+                    channel: format!("dm:{}", peer_b()),
+                    first_unread_at: 10,
+                    last_unread_at: 20,
+                },
+                // The conversation opened at startup is treated as read.
+                UnreadConversation {
+                    channel: GENERAL.to_string(),
+                    first_unread_at: 10,
+                    last_unread_at: 20,
+                },
+            ],
         };
         app.apply_history(history);
 
@@ -957,6 +1042,8 @@ mod tests {
         assert_eq!(app.groups[0].name, "team");
         assert!(app.is_group_member("g1"));
         assert!(app.is_pending("out-1"));
+        assert!(app.has_unread(&format!("dm:{}", peer_b())));
+        assert!(!app.has_unread(GENERAL));
 
         app.set_message_pending("out-1", false);
         assert!(!app.is_pending("out-1"));

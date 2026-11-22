@@ -167,7 +167,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             identity_path.display()
         );
         drop(events);
-        ui::cli::run(network.peer_id, username, command_tx.clone(), ui_event_rx).await
+        ui::cli::run(
+            network.peer_id,
+            username,
+            command_tx.clone(),
+            ui_event_rx,
+            store.clone(),
+        )
+        .await
     } else {
         ui::run(
             network.peer_id,

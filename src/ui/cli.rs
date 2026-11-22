@@ -10,10 +10,13 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use uuid::Uuid;
 
 use super::complete::{unique_prefix, COMMANDS};
-use crate::network::{
-    events::{display_name, short_peer_id},
-    protocol::ChatMessage,
-    NetworkCommand, NetworkEvent,
+use crate::{
+    network::{
+        events::{display_name, short_peer_id},
+        protocol::ChatMessage,
+        NetworkCommand, NetworkEvent,
+    },
+    worker::Store,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +181,7 @@ pub async fn run(
     local_username: String,
     cmd_tx: Sender<NetworkCommand>,
     mut event_rx: Receiver<NetworkEvent>,
+    store: Store,
 ) -> Result<(), Box<dyn Error>> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
@@ -218,6 +222,10 @@ pub async fn run(
             }
             event = event_rx.recv() => {
                 let Some(event) = event else { break };
+                // The plain CLI prints incoming messages immediately, so they are read at once.
+                if let NetworkEvent::MessageReceived { message } = &event {
+                    store.record_incoming_message(message, &message.channel, false);
+                }
                 update_peer_list(&mut peers, &event);
 
                 let mut skip_print = false;

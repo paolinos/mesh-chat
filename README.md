@@ -55,8 +55,9 @@ Each directory gets its own `identity.key`, `chat.db` and `chat.log`. Peers shou
 - `Tab` completes what you are typing: slash commands, `/group` subcommands, usernames after `/users` or `/group add`, and group names. A hint appears under the input; `Esc` dismisses it. Unambiguous prefixes such as `/u` or `/g cr` also work when you press `Enter`, without completing first.
 - `↑`/`↓` select a channel or group; `Enter` or `Tab` switches to it; `Esc` returns focus to the input. Typing any character also returns focus to the input.
 - `/quit`, `/exit` or `Ctrl+C` exits and restores the terminal.
+- Incoming messages in a conversation you are not viewing add a yellow `●` to its label in `CHANNELS`/`GROUPS` and in the header tabs. Opening the conversation clears it, even after a restart: unread conversations (with first/last unread timestamps) are stored in SQLite and the row is deleted once read.
 
-The complete `/u` → Tab → username → Tab → send flow is covered end to end in `src/ui/autocomplete_tests.rs`.
+The complete `/u` → Tab → username → Tab → send flow is covered end to end in `src/ui/autocomplete_tests.rs`; the unread-marker flow is covered in `src/ui/unread_tests.rs`.
 
 | Command | Effect |
 | --- | --- |

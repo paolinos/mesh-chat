@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod autocomplete_tests;
+#[cfg(test)]
+mod unread_tests;
 
 pub mod app;
 pub mod cli;
@@ -45,7 +47,10 @@ fn handle_network_event(app: &mut App, event: NetworkEvent, store: Option<&Store
             online: false,
         } => app.add_or_update_peer(peer_id, &username, false),
         NetworkEvent::MessageReceived { message } => {
-            app.record_incoming(message);
+            let key = app.record_incoming(message.clone());
+            if let (Some(store), Some(key)) = (store, key) {
+                store.record_incoming_message(&message, &key, key != app.active_conversation);
+            }
         }
         NetworkEvent::GroupInviteReceived {
             from,
@@ -258,6 +263,7 @@ async fn tui_loop(
     mut worker_events: tokio::sync::mpsc::UnboundedReceiver<WorkerEvent>,
 ) -> Result<(), Box<dyn Error>> {
     let mut tick = tokio::time::interval(Duration::from_millis(80));
+    let mut last_active = app.active_conversation.clone();
     loop {
         terminal.draw(|frame| render::render(frame, app))?;
 
@@ -283,6 +289,11 @@ async fn tui_loop(
                 }
             }
         }
+        // Opening a conversation (by key, command, or invite) clears its persisted marker.
+        if app.active_conversation != last_active {
+            store.mark_conversation_read(&app.active_conversation);
+            last_active = app.active_conversation.clone();
+        }
     }
 }
 
@@ -303,6 +314,8 @@ pub async fn run(
         Ok(history) => app.apply_history(history),
         Err(error) => app.system(format!("! could not load saved history: {error}")),
     }
+    // The startup conversation is open, so drop any marker left for it by a previous run.
+    store.mark_conversation_read(&app.active_conversation);
     app.system("Welcome! /help lists commands. mDNS discovery may take a few seconds.");
 
     let result = tui_loop(
