@@ -179,7 +179,9 @@ pub async fn handle_action(
             Ok(peer_id) => {
                 let channel = format!("dm:{peer_id}");
                 app.activate_conversation(&channel);
-                send_message(app, me, username, channel, body, vec![peer_id], store).await;
+                if !body.trim().is_empty() {
+                    send_message(app, me, username, channel, body, vec![peer_id], store).await;
+                }
             }
             Err(error) => app.system(error.to_string()),
         },
@@ -515,5 +517,45 @@ mod tests {
     #[test]
     fn cli_module_is_wired_in() {
         assert_eq!(super::cli::parse_input("/quit"), super::cli::InputAction::Quit);
+    }
+
+    #[tokio::test]
+    async fn users_name_without_body_switches_to_dm_without_sending() {
+        use crate::worker::Store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (network_tx, _network_rx) = tokio::sync::mpsc::channel(4);
+        let me = PeerId::random();
+        let (store, handle) = Store::spawn(
+            &dir.path().join("chat.db"),
+            dir.path().to_path_buf(),
+            me,
+            "alice".to_string(),
+            network_tx,
+        )
+        .unwrap();
+
+        let bob = PeerId::random();
+        let mut app = App::new(me, "alice".to_string());
+        app.add_or_update_peer(bob, "bob", true);
+        let dm = format!("dm:{bob}");
+
+        handle_action(
+            &mut app,
+            me,
+            "alice",
+            Action::SendDm {
+                user: "bob".to_string(),
+                body: "".to_string(),
+            },
+            &store,
+        )
+        .await;
+
+        assert_eq!(app.active_conversation, dm);
+        assert!(app.conversations[&dm].is_empty());
+
+        store.shutdown();
+        let _ = handle.task.await;
     }
 }
