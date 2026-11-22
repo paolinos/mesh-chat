@@ -46,6 +46,13 @@ pub enum ChatResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String,
     pub from_peer: String,
@@ -57,6 +64,9 @@ pub struct ChatMessage {
     /// Phase-3 outbox id echoed back in the ACK. `None` for older peers or incoming messages.
     #[serde(default)]
     pub outbox_id: Option<u64>,
+    /// Files attached to this message. Empty for older peers or plain text messages.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +96,27 @@ mod tests {
             body: "hello\nworld".to_string(),
             created_at: 42,
             outbox_id: None,
+            attachments: Vec::new(),
+        });
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert_eq!(serde_json::from_slice::<ChatRequest>(&bytes).unwrap(), request);
+    }
+
+    #[test]
+    fn chat_request_with_attachments_round_trip() {
+        let request = ChatRequest::Chat(ChatMessage {
+            id: "m-2".to_string(),
+            from_peer: "peer".to_string(),
+            from_username: "alice".to_string(),
+            channel: "dm:12D3KooWJ2q5Aj9fMZ43AFFz152XxBRQEDBsUo7hHKi4YpYJ4yyB".to_string(),
+            body: "see attached".to_string(),
+            created_at: 42,
+            outbox_id: Some(7),
+            attachments: vec![Attachment {
+                filename: "note.txt".to_string(),
+                bytes: b"hello file".to_vec(),
+                mime_type: Some("text/plain".to_string()),
+            }],
         });
         let bytes = serde_json::to_vec(&request).unwrap();
         assert_eq!(serde_json::from_slice::<ChatRequest>(&bytes).unwrap(), request);
@@ -136,6 +167,36 @@ mod tests {
                 body: "hello".to_string(),
                 created_at: 42,
                 outbox_id: None,
+                attachments: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn older_payloads_without_attachments_still_deserialize() {
+        let old = r##"{
+            "Chat": {
+                "id": "m-1",
+                "from_peer": "peer",
+                "from_username": "alice",
+                "channel": "#general",
+                "body": "hello",
+                "created_at": 42,
+                "outbox_id": null
+            }
+        }"##;
+        let request: ChatRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            request,
+            ChatRequest::Chat(ChatMessage {
+                id: "m-1".to_string(),
+                from_peer: "peer".to_string(),
+                from_username: "alice".to_string(),
+                channel: "#general".to_string(),
+                body: "hello".to_string(),
+                created_at: 42,
+                outbox_id: None,
+                attachments: Vec::new(),
             })
         );
     }

@@ -153,6 +153,7 @@ pub fn make_message(
         body,
         created_at: now_millis(),
         outbox_id: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -784,6 +785,7 @@ mod tests {
             body: body.to_string(),
             created_at: 1,
             outbox_id: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -825,6 +827,7 @@ mod tests {
         // A DM with an unparseable sender must not create a stray channel.
         let bad_sender = ChatMessage {
             from_peer: "not-a-peer".to_string(),
+            attachments: Vec::new(),
             ..message("dm:not-a-peer", "m5", "ignored")
         };
         assert!(app.record_incoming(bad_sender).is_none());
@@ -1001,6 +1004,7 @@ mod tests {
                     direction: "in".to_string(),
                     body: "old hello".to_string(),
                     created_at: 1,
+                    attachments: Vec::new(),
                 },
                 StoredMessage {
                     id: "out-1".to_string(),
@@ -1010,6 +1014,7 @@ mod tests {
                     direction: "out".to_string(),
                     body: "queued".to_string(),
                     created_at: 2,
+                    attachments: Vec::new(),
                 },
             ],
             groups: vec![StoredGroup {

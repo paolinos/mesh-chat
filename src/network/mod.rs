@@ -534,6 +534,7 @@ mod tests {
             body: "hi".to_string(),
             created_at: 1,
             outbox_id: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -599,6 +600,7 @@ mod tests {
         let peer = PeerId::random();
         let tracked = ChatRequest::Chat(ChatMessage {
             outbox_id: Some(42),
+            attachments: Vec::new(),
             ..message()
         });
         assert_eq!(

@@ -110,7 +110,9 @@ mod scenario_tests {
 
         // Simulate receiving a message while the DM is not open: message and marker are written
         // together.
-        assert!(database.insert_incoming_message(&message, &dm, true).unwrap());
+        assert!(database
+            .insert_incoming_message(&message, &dm, true, &[])
+            .unwrap());
         let history = database.history().unwrap();
         assert_eq!(history.unread.len(), 1);
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     fmt,
     fs,
@@ -72,6 +72,14 @@ pub struct StoredPeer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAttachment {
+    pub filename: String,
+    pub local_path: String,
+    pub size_bytes: i64,
+    pub is_sender: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMessage {
     pub id: String,
     pub channel: String,
@@ -80,6 +88,7 @@ pub struct StoredMessage {
     pub direction: String,
     pub body: String,
     pub created_at: i64,
+    pub attachments: Vec<StoredAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +141,7 @@ impl Database {
         )?;
         conn.execute_batch(include_str!("migration/0001_schema.sql"))?;
         conn.execute_batch(include_str!("migration/0002_unread.sql"))?;
+        conn.execute_batch(include_str!("migration/0003_attachments.sql"))?;
         Ok(Self { conn })
     }
 
@@ -175,12 +185,14 @@ impl Database {
 
     /// Store an incoming message once. The UUID is the dedupe key. The unread marker for the
     /// canonical conversation is written in the same transaction, and removed when the message
-    /// is read immediately.
+    /// is read immediately. Attachment metadata (already saved to disk by the caller) is inserted
+    /// in the same transaction.
     pub fn insert_incoming_message(
         &mut self,
         message: &ChatMessage,
         conversation: &str,
         unread: bool,
+        attachments: &[StoredAttachment],
     ) -> Result<bool> {
         let tx = self.conn.transaction()?;
         let now = now_millis();
@@ -200,6 +212,9 @@ impl Database {
                 message.created_at
             ],
         )?;
+        if changed > 0 {
+            insert_attachment_rows(&tx, &message.id, conversation, attachments, now)?;
+        }
         if unread && changed > 0 {
             tx.execute(
                 "INSERT INTO unread_conversations (channel, first_unread_at, last_unread_at)
@@ -226,11 +241,14 @@ impl Database {
         Ok(())
     }
 
-    /// Insert one outgoing message row and one outbox row per recipient in a single transaction.
+    /// Insert one outgoing message row, attachment rows, and one outbox row per recipient in a
+    /// single transaction. The caller is responsible for reading source files and deciding whether
+    /// the message may be sent; this method only persists metadata.
     pub fn save_outgoing(
         &mut self,
         message: &ChatMessage,
         recipients: &[PeerId],
+        attachments: &[StoredAttachment],
     ) -> Result<Vec<OutboxRow>> {
         let now = now_millis();
         let tx = self.conn.transaction()?;
@@ -250,6 +268,7 @@ impl Database {
                 message.created_at
             ],
         )?;
+        insert_attachment_rows(&tx, &message.id, &message.channel, attachments, now)?;
 
         let mut queued = Vec::new();
         for recipient in recipients {
@@ -267,6 +286,7 @@ impl Database {
             )?;
             let request = ChatRequest::Chat(ChatMessage {
                 outbox_id: Some(id),
+                attachments: Vec::new(),
                 ..message.clone()
             });
             set_outbox_payload(&tx, id, &request)?;
@@ -528,19 +548,46 @@ impl Database {
         }
         drop(peers);
 
+        let mut attachments_by_message: HashMap<String, Vec<StoredAttachment>> = HashMap::new();
+        let mut attachments = self.conn.prepare(
+            "SELECT message_id, filename, local_path, size_bytes, is_sender
+             FROM message_attachments ORDER BY id",
+        )?;
+        let attachment_rows = attachments.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                StoredAttachment {
+                    filename: row.get(1)?,
+                    local_path: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    is_sender: row.get::<_, i64>(4)? != 0,
+                },
+            ))
+        })?;
+        for row in attachment_rows {
+            let (message_id, attachment) = row?;
+            attachments_by_message
+                .entry(message_id)
+                .or_default()
+                .push(attachment);
+        }
+        drop(attachments);
+
         let mut messages = self.conn.prepare(
             "SELECT id, channel, peer_id, username_snapshot, direction, body, created_at
              FROM messages ORDER BY created_at, id",
         )?;
         let message_rows = messages.query_map([], |row| {
+            let id: String = row.get(0)?;
             Ok(StoredMessage {
-                id: row.get(0)?,
+                id: id.clone(),
                 channel: row.get(1)?,
                 peer_id: row.get(2)?,
                 username_snapshot: row.get(3)?,
                 direction: row.get(4)?,
                 body: row.get(5)?,
                 created_at: row.get(6)?,
+                attachments: attachments_by_message.remove(&id).unwrap_or_default(),
             })
         })?;
         for message in message_rows {
@@ -595,6 +642,32 @@ impl Database {
         }
         Ok(history)
     }
+}
+
+fn insert_attachment_rows(
+    tx: &Transaction<'_>,
+    message_id: &str,
+    channel: &str,
+    attachments: &[StoredAttachment],
+    now: i64,
+) -> Result<()> {
+    for attachment in attachments {
+        tx.execute(
+            "INSERT INTO message_attachments
+             (message_id, channel, filename, local_path, size_bytes, is_sender, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                message_id,
+                channel,
+                attachment.filename,
+                attachment.local_path,
+                attachment.size_bytes,
+                i64::from(attachment.is_sender),
+                now,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn primary_recipient(recipients: &[PeerId]) -> String {
@@ -766,6 +839,7 @@ mod tests {
             body: "hello".to_string(),
             created_at: 10,
             outbox_id: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -791,6 +865,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unread_table, "unread_conversations");
+        let attachments_table: String = database
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'message_attachments'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attachments_table, "message_attachments");
         let history = database.history().unwrap();
         assert_eq!(history.peers.len(), 1);
         assert!(history.peers[0].is_local);
@@ -803,7 +886,7 @@ mod tests {
         database.upsert_local_peer(&alice(), "alice").unwrap();
         database.set_peer_online(bob(), Some("bob"), true).unwrap();
         database
-            .save_outgoing(&message("m1", "#general"), &[bob()])
+            .save_outgoing(&message("m1", "#general"), &[bob()], &[])
             .unwrap();
         assert_eq!(database.claim_due(now_millis() + 1, 10).unwrap().len(), 1);
 
@@ -831,13 +914,13 @@ mod tests {
             ..message("m1", "#general")
         };
         assert!(database
-            .insert_incoming_message(&incoming, "#general", true)
+            .insert_incoming_message(&incoming, "#general", true, &[])
             .unwrap());
         let history = database.history().unwrap();
         assert_eq!(history.unread.len(), 1);
         assert_eq!(history.unread[0].channel, "#general");
         assert!(!database
-            .insert_incoming_message(&incoming, "#general", true)
+            .insert_incoming_message(&incoming, "#general", true, &[])
             .unwrap());
         let history = database.history().unwrap();
         assert_eq!(history.messages.len(), 1);
@@ -846,6 +929,64 @@ mod tests {
         assert_eq!(history.unread.len(), 1);
         assert_eq!(history.unread[0].first_unread_at, history.unread[0].last_unread_at);
         assert!(history.peers.iter().any(|peer| peer.peer_id == bob().to_string() && peer.online));
+    }
+
+    #[test]
+    fn outgoing_message_with_attachments_persists_metadata() {
+        let (_dir, mut database) = db();
+        database.upsert_local_peer(&alice(), "alice").unwrap();
+        database.set_peer_online(bob(), Some("bob"), true).unwrap();
+
+        let attachments = vec![StoredAttachment {
+            filename: "report.pdf".to_string(),
+            local_path: "/home/alice/docs/report.pdf".to_string(),
+            size_bytes: 1234,
+            is_sender: true,
+        }];
+        database
+            .save_outgoing(&message("m1", "dm:bob"), &[bob()], &attachments)
+            .unwrap();
+
+        let history = database.history().unwrap();
+        assert_eq!(history.messages.len(), 1);
+        let stored = &history.messages[0];
+        assert_eq!(stored.attachments.len(), 1);
+        assert_eq!(stored.attachments[0].filename, "report.pdf");
+        assert_eq!(stored.attachments[0].local_path, "/home/alice/docs/report.pdf");
+        assert_eq!(stored.attachments[0].size_bytes, 1234);
+        assert!(stored.attachments[0].is_sender);
+    }
+
+    #[test]
+    fn incoming_message_with_attachments_persists_metadata() {
+        let (_dir, mut database) = db();
+        let incoming = ChatMessage {
+            from_peer: bob().to_string(),
+            from_username: "bob".to_string(),
+            attachments: Vec::new(),
+            ..message("m1", "dm:me")
+        };
+        let attachments = vec![StoredAttachment {
+            filename: "note.txt".to_string(),
+            local_path: "data/downloads/20250115_bob_note.txt".to_string(),
+            size_bytes: 42,
+            is_sender: false,
+        }];
+
+        assert!(database
+            .insert_incoming_message(&incoming, "dm:bob", true, &attachments)
+            .unwrap());
+        let history = database.history().unwrap();
+        assert_eq!(history.messages.len(), 1);
+        let stored = &history.messages[0];
+        assert_eq!(stored.attachments.len(), 1);
+        assert_eq!(stored.attachments[0].filename, "note.txt");
+        assert_eq!(
+            stored.attachments[0].local_path,
+            "data/downloads/20250115_bob_note.txt"
+        );
+        assert_eq!(stored.attachments[0].size_bytes, 42);
+        assert!(!stored.attachments[0].is_sender);
     }
 
     #[test]
@@ -863,7 +1004,7 @@ mod tests {
         };
 
         assert!(database
-            .insert_incoming_message(&first, "dm:bob", true)
+            .insert_incoming_message(&first, "dm:bob", true, &[])
             .unwrap());
         let history = database.history().unwrap();
         assert_eq!(history.unread.len(), 1);
@@ -873,7 +1014,7 @@ mod tests {
         let initial_first = first_row.first_unread_at;
 
         assert!(database
-            .insert_incoming_message(&second, "dm:bob", true)
+            .insert_incoming_message(&second, "dm:bob", true, &[])
             .unwrap());
         let history = database.history().unwrap();
         assert_eq!(history.unread.len(), 1);
@@ -886,7 +1027,7 @@ mod tests {
             ..first.clone()
         };
         assert!(database
-            .insert_incoming_message(&third, "dm:bob", false)
+            .insert_incoming_message(&third, "dm:bob", false, &[])
             .unwrap());
         assert!(database.history().unwrap().unread.is_empty());
 
@@ -895,7 +1036,7 @@ mod tests {
             ..first.clone()
         };
         assert!(database
-            .insert_incoming_message(&fourth, "dm:bob", true)
+            .insert_incoming_message(&fourth, "dm:bob", true, &[])
             .unwrap());
         assert_eq!(database.history().unwrap().unread.len(), 1);
         database.clear_unread("dm:bob").unwrap();
@@ -907,7 +1048,7 @@ mod tests {
         let (_dir, mut database) = db();
         database.upsert_local_peer(&alice(), "alice").unwrap();
         let queued = database
-            .save_outgoing(&message("m1", &format!("dm:{}", bob())), &[bob()])
+            .save_outgoing(&message("m1", &format!("dm:{}", bob())), &[bob()], &[])
             .unwrap();
         assert_eq!(queued.len(), 1);
         assert!(database.claim_due(now_millis() + 1, 10).unwrap().is_empty());
@@ -944,7 +1085,7 @@ mod tests {
         database.upsert_local_peer(&alice(), "alice").unwrap();
         database.set_peer_online(bob(), Some("bob"), true).unwrap();
         database
-            .save_outgoing(&message("m1", "#general"), &[bob()])
+            .save_outgoing(&message("m1", "#general"), &[bob()], &[])
             .unwrap();
         assert_eq!(database.claim_due(now_millis() + 1, 10).unwrap().len(), 1);
 

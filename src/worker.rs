@@ -343,7 +343,7 @@ fn handle_command(
             reply,
         } => {
             let result = database
-                .save_outgoing(&message, &recipients)
+                .save_outgoing(&message, &recipients, &[])
                 .map(|_| ())
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
@@ -383,7 +383,7 @@ fn handle_command(
             unread,
         } => {
             if let Err(error) =
-                database.insert_incoming_message(&message, &conversation, unread)
+                database.insert_incoming_message(&message, &conversation, unread, &[])
             {
                 warn!(%error, "could not store incoming message");
             }
@@ -530,6 +530,7 @@ mod tests {
             body: "hello".to_string(),
             created_at: 1,
             outbox_id: None,
+            attachments: Vec::new(),
         }
     }
 

@@ -355,6 +355,7 @@ mod tests {
             body: "hello".to_string(),
             created_at: 1,
             outbox_id: None,
+            attachments: Vec::new(),
         }
     }
 

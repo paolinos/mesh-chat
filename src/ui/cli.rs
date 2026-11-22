@@ -86,6 +86,7 @@ pub fn make_chat_message(local_peer_id: &PeerId, username: &str, body: String) -
         body,
         created_at: now_millis(),
         outbox_id: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -301,6 +302,7 @@ mod tests {
             body: "hi there".to_string(),
             created_at: 1,
             outbox_id: None,
+            attachments: Vec::new(),
         };
         let text = format_event(&NetworkEvent::MessageReceived { message }).unwrap();
         assert!(text.contains("hi there"));
