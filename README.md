@@ -52,8 +52,11 @@ Each directory gets its own `identity.key`, `chat.db` and `chat.log`. Peers shou
 ### Using the TUI
 
 - `Enter` sends the current input; `Shift+Enter` inserts a newline.
+- `Tab` completes what you are typing: slash commands, `/group` subcommands, usernames after `/users` or `/group add`, and group names. A hint appears under the input; `Esc` dismisses it. Unambiguous prefixes such as `/u` or `/g cr` also work when you press `Enter`, without completing first.
 - `↑`/`↓` select a channel or group; `Enter` or `Tab` switches to it; `Esc` returns focus to the input. Typing any character also returns focus to the input.
 - `/quit`, `/exit` or `Ctrl+C` exits and restores the terminal.
+
+The complete `/u` → Tab → username → Tab → send flow is covered end to end in `src/ui/autocomplete_tests.rs`.
 
 | Command | Effect |
 | --- | --- |
@@ -124,7 +127,7 @@ The outbox stores one row per (message, recipient), so group fan-out is acknowle
 
 - mDNS peer discovery with stable PeerIds persisted in an identity file.
 - Noise-encrypted direct messages, one-to-one and `#general` broadcasts, with delivery acknowledgements.
-- Full-screen terminal UI with multiline input, channels, direct messages, stable per-peer colors and `(Pending)` state; a plain `--simple` CLI is also available.
+- Full-screen terminal UI with multiline input, command/username autocompletion, channels, direct messages, stable per-peer colors and `(Pending)` state; a plain `--simple` CLI is also available.
 - Private invite-only groups with chain invites: any member can invite more members, and member lists converge across all existing members. Non-members never see group names or messages.
 - Local SQLite persistence: history, peers, group memberships and an outbox with exponential-backoff retries and offline flushing on reconnect.
 - Unit tests across all modules (`make test`).

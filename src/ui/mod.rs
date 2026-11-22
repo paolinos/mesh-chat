@@ -1,5 +1,9 @@
+#[cfg(test)]
+mod autocomplete_tests;
+
 pub mod app;
 pub mod cli;
+pub mod complete;
 pub mod input;
 pub mod render;
 

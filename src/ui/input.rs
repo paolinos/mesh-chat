@@ -2,9 +2,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tui_textarea::Input;
 
 use super::app::{App, Selection};
+use super::complete::{unique_prefix, COMMANDS, GROUP_SUBCOMMANDS};
 
-pub const HELP: &str =
-    "Commands: /users [name] [message], /group create <name>, /group add <group> <user>, /group members <group>, /quit";
+pub const HELP: &str = "Commands: /users [name] [message], /group create <name>, /group add <group> <user>, /group members <group>, /help, /quit. Tab completes commands and names.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -52,6 +52,17 @@ pub fn parse_input(line: &str) -> Command {
         None => (trimmed, ""),
     };
 
+    // Unambiguous prefixes work even without pressing Tab: `/u` means `/users`.
+    let mut words = first.splitn(2, char::is_whitespace);
+    let head = words.next().unwrap_or("");
+    let tail = words.next().unwrap_or("");
+    let head = unique_prefix(head, COMMANDS).unwrap_or(head);
+    let first = if tail.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head} {tail}")
+    };
+
     if first == "/quit" || first == "/exit" {
         return Command::Quit;
     }
@@ -74,6 +85,15 @@ pub fn parse_input(line: &str) -> Command {
     }
     if let Some(args) = first.strip_prefix("/group ") {
         let args = args.trim();
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let subcommand = parts.next().unwrap_or("");
+        let detail = parts.next().unwrap_or("");
+        let subcommand = unique_prefix(subcommand, GROUP_SUBCOMMANDS).unwrap_or(subcommand);
+        let args = if detail.is_empty() {
+            subcommand.to_string()
+        } else {
+            format!("{subcommand} {detail}")
+        };
         if let Some(name) = args.strip_prefix("create ") {
             let name = name.trim();
             return if name.is_empty() {
@@ -132,19 +152,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
             InputResult::Redraw
         }
         KeyCode::Tab => {
-            match app.selection {
-                Selection::Channels => {
-                    app.activate_selected_channel();
+            // Completion wins over channel cycling; without a hint Tab behaves as before.
+            if !app.accept_completion() {
+                match app.selection {
+                    Selection::Channels => {
+                        app.activate_selected_channel();
+                    }
+                    Selection::Groups => {
+                        app.activate_selected_group();
+                    }
+                    Selection::None => app.cycle_conversation(),
                 }
-                Selection::Groups => {
-                    app.activate_selected_group();
-                }
-                Selection::None => app.cycle_conversation(),
             }
             InputResult::Redraw
         }
         KeyCode::Esc => {
-            app.selection = Selection::None;
+            if !app.dismiss_completion() {
+                app.selection = Selection::None;
+            }
             InputResult::Redraw
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -156,6 +181,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
                 alt: false,
                 shift: true,
             });
+            app.refresh_completion();
             InputResult::Redraw
         }
         KeyCode::Enter => match app.selection {
@@ -181,6 +207,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
             // Otherwise the next Enter would only re-activate the highlighted channel.
             app.selection = Selection::None;
             app.textarea.input(Input::from(key));
+            app.refresh_completion();
             InputResult::Redraw
         }
     }
@@ -209,6 +236,21 @@ mod tests {
         assert_eq!(parse_input("/users"), Command::Users);
         assert_eq!(parse_input("/help"), Command::Help);
         assert_eq!(parse_input("/bogus"), Command::Help);
+    }
+
+    #[test]
+    fn unique_command_prefixes_are_accepted() {
+        assert_eq!(parse_input("/u"), Command::Users);
+        assert_eq!(parse_input("/q"), Command::Quit);
+        assert_eq!(parse_input("/e"), Command::Quit);
+        assert_eq!(parse_input("/g cr team"), Command::GroupCreate("team".to_string()));
+        assert_eq!(
+            parse_input("/users bo hi"),
+            Command::Dm {
+                user: "bo".to_string(),
+                body: "hi".to_string()
+            }
+        );
     }
 
     #[test]
@@ -350,6 +392,73 @@ mod tests {
             InputResult::Redraw
         );
         assert_eq!(app.active_conversation, GENERAL);
+    }
+
+    #[test]
+    fn tab_completes_commands_and_usernames() {
+        let mut app = App::new(PeerId::random(), "me".to_string());
+        app.add_or_update_peer(PeerId::random(), "bob", true);
+        app.add_or_update_peer(PeerId::random(), "bobby", false);
+
+        for ch in "/us".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert!(app.completion.is_some());
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Tab, KeyModifiers::NONE)),
+            InputResult::Redraw
+        );
+        assert_eq!(app.textarea_text(), "/users ");
+
+        handle_key(&mut app, key(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(app.completion.is_some());
+        assert_eq!(
+            app.completion.as_ref().unwrap().candidates[0].value,
+            "bob"
+        );
+        handle_key(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.textarea_text(), "/users bob ");
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn tab_completes_group_arguments() {
+        let mut app = App::new(PeerId::random(), "me".to_string());
+        app.add_or_update_peer(PeerId::random(), "bob", true);
+        app.create_group("team");
+
+        app.textarea.insert_str("/group add te");
+        app.refresh_completion();
+        handle_key(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.textarea_text(), "/group add team ");
+
+        app.textarea.insert_str("bo");
+        app.refresh_completion();
+        handle_key(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.textarea_text(), "/group add team bob ");
+    }
+
+    #[test]
+    fn esc_dismisses_hint_until_prefix_changes() {
+        let mut app = App::new(PeerId::random(), "me".to_string());
+        app.textarea.insert_str("/u");
+        app.refresh_completion();
+        assert!(app.completion.is_some());
+
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Esc, KeyModifiers::NONE)),
+            InputResult::Redraw
+        );
+        assert!(app.completion.is_none());
+        app.refresh_completion();
+        assert!(app.completion.is_none());
+
+        app.textarea.insert_str("s");
+        app.refresh_completion();
+        assert_eq!(
+            app.completion.as_ref().unwrap().candidates[0].value,
+            "/users"
+        );
     }
 
     #[test]

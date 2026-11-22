@@ -9,6 +9,7 @@ use libp2p::PeerId;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use uuid::Uuid;
 
+use super::complete::{unique_prefix, COMMANDS};
 use crate::network::{
     events::{display_name, short_peer_id},
     protocol::ChatMessage,
@@ -40,12 +41,17 @@ pub fn validate_username(raw: &str) -> Result<String, &'static str> {
 
 pub fn parse_input(line: &str) -> InputAction {
     let trimmed = line.trim();
-    match trimmed {
-        "" => InputAction::Ignore,
+    if trimmed.is_empty() {
+        return InputAction::Ignore;
+    }
+    let (head, tail) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
+    match unique_prefix(head, COMMANDS).unwrap_or(head) {
         "/quit" | "/exit" => InputAction::Quit,
-        "/users" => InputAction::Users,
-        text if text.starts_with('/') => InputAction::Ignore,
-        text => InputAction::Chat(text.to_string()),
+        "/users" if tail.trim().is_empty() => InputAction::Users,
+        _ if trimmed.starts_with('/') => InputAction::Ignore,
+        _ => InputAction::Chat(trimmed.to_string()),
     }
 }
 
@@ -191,7 +197,7 @@ pub async fn run(
     let mut reported_online = HashSet::new();
 
     println!("Connected as {} ({})", local_username, short_peer_id(&local_peer_id));
-    println!("Type a message and press Enter. /users lists peers, /quit exits.");
+    println!("Type a message and press Enter. /users (or /u) lists peers, /quit exits.");
     println!("Looking for peers on the local network with mDNS...\n");
 
     loop {
@@ -261,7 +267,9 @@ mod tests {
     fn parses_commands() {
         assert_eq!(parse_input("   "), InputAction::Ignore);
         assert_eq!(parse_input("/quit"), InputAction::Quit);
+        assert_eq!(parse_input("/q"), InputAction::Quit);
         assert_eq!(parse_input("/users"), InputAction::Users);
+        assert_eq!(parse_input("/u"), InputAction::Users);
         assert_eq!(parse_input("/unknown"), InputAction::Ignore);
         assert_eq!(parse_input(" hello world "), InputAction::Chat("hello world".to_string()));
     }

@@ -14,6 +14,7 @@ use libp2p::PeerId;
 use ratatui::{backend::CrosstermBackend, style::Color, Terminal};
 use uuid::Uuid;
 
+use super::complete::{apply_candidate, find_completion, Completion};
 use crate::{database::History, network::{events::display_name, protocol::ChatMessage}};
 
 pub const GENERAL: &str = "#general";
@@ -173,6 +174,10 @@ pub struct App<'a> {
     pub channel_selection: usize,
     pub group_selection: usize,
     pub textarea: tui_textarea::TextArea<'a>,
+    /// Suggestions for the token under the caret, shown in the input panel.
+    pub completion: Option<Completion>,
+    /// Prefix the user explicitly dismissed with Esc; stays quiet until the token changes.
+    dismissed_completion: Option<String>,
     /// message id -> peers whose ACK has not arrived yet.
     pending: HashMap<String, HashSet<PeerId>>,
     seen_messages: HashSet<String>,
@@ -195,9 +200,50 @@ impl<'a> App<'a> {
             channel_selection: 0,
             group_selection: 0,
             textarea,
+            completion: None,
+            dismissed_completion: None,
             pending: HashMap::new(),
             seen_messages: HashSet::new(),
         }
+    }
+
+    /// Recompute suggestions after an edit. A dismissed prefix is not shown again until the
+    /// user changes it.
+    pub fn refresh_completion(&mut self) {
+        let next = find_completion(self);
+        if let (Some(dismissed), Some(completion)) = (&self.dismissed_completion, &next) {
+            if dismissed == &completion.prefix {
+                self.completion = None;
+                return;
+            }
+        }
+        self.dismissed_completion = None;
+        self.completion = next;
+    }
+
+    /// Hide the current hint until the token changes. Returns whether a hint was visible.
+    pub fn dismiss_completion(&mut self) -> bool {
+        match self.completion.take() {
+            Some(completion) => {
+                self.dismissed_completion = Some(completion.prefix);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Insert the first suggestion. Returns whether a completion was applied.
+    pub fn accept_completion(&mut self) -> bool {
+        let Some(completion) = self.completion.take() else {
+            return false;
+        };
+        let Some(candidate) = completion.candidates.first().cloned() else {
+            return false;
+        };
+        apply_candidate(&mut self.textarea, &completion, &candidate);
+        self.dismissed_completion = None;
+        self.refresh_completion();
+        true
     }
 
     /// Fill the TUI from SQLite on startup without re-broadcasting presence from old messages.
@@ -666,6 +712,8 @@ impl<'a> App<'a> {
         self.textarea = tui_textarea::TextArea::default();
         self.textarea
             .set_placeholder_text("Type a message; Shift+Enter inserts a newline");
+        self.completion = None;
+        self.dismissed_completion = None;
     }
 
     pub fn activate_selected_group(&mut self) -> bool {

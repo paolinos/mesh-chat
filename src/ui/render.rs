@@ -109,6 +109,38 @@ fn header(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The completion hint sits on its own row inside the input panel.
+fn completion_hint(app: &App) -> Option<Line<'static>> {
+    let completion = app.completion.as_ref()?;
+    let best = completion.candidates.first()?;
+    let mut spans = vec![
+        Span::styled(
+            "Tab ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("→ "),
+        Span::styled(best.label.clone(), Style::default().fg(Color::Cyan)),
+    ];
+    if completion.candidates.len() > 1 {
+        let others = completion.candidates[1..]
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        spans.push(Span::styled(
+            format!("  (also: {others})"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans.push(Span::styled(
+        "  Esc to dismiss".to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    Some(Line::from(spans))
+}
+
 fn chat_lines(app: &App) -> Vec<Line<'static>> {
     let mut rendered = Vec::new();
     let Some(lines) = app.conversations.get(&app.active_conversation) else {
@@ -194,13 +226,15 @@ pub fn render(frame: &mut Frame, app: &App) {
         groups,
     );
 
-    let input_height = app
+    let hint = completion_hint(app);
+    let input_height: u16 = app
         .textarea
         .lines()
         .len()
         .clamp(3, 10)
         .try_into()
         .unwrap_or(3);
+    let input_height = input_height + u16::from(hint.is_some());
     let [head, chat, input] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -217,10 +251,17 @@ pub fn render(frame: &mut Frame, app: &App) {
     let start = lines.len().saturating_sub(chat_inner.height as usize);
     frame.render_widget(Paragraph::new(lines[start..].to_vec()), chat_inner);
 
-    let input_block = Block::bordered().title("Message (Shift+Enter = newline)");
+    let input_block = Block::bordered().title("Message (Tab = complete, Shift+Enter = newline)");
     let input_inner = input_block.inner(input);
     frame.render_widget(input_block, input);
-    frame.render_widget(&app.textarea, input_inner);
+    if hint.is_some() {
+        let [textarea_area, hint_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(input_inner);
+        frame.render_widget(&app.textarea, textarea_area);
+        frame.render_widget(Paragraph::new(hint.unwrap()), hint_area);
+    } else {
+        frame.render_widget(&app.textarea, input_inner);
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +335,20 @@ mod tests {
         assert!(outgoing_col > 55, "own text should be right aligned");
 
         assert!(app.group(&group_id).is_some());
+    }
+
+    #[test]
+    fn shows_completion_hint_below_the_input() {
+        let mut app = App::new(PeerId::random(), "me".to_string());
+        app.add_or_update_peer(PeerId::random(), "bob", true);
+        app.textarea.insert_str("/users b");
+        app.refresh_completion();
+
+        let screen = rendered(&app);
+        assert!(screen.contains("/users "));
+        assert!(screen.contains("Tab"));
+        assert!(screen.contains("bob"));
+        assert!(screen.contains("Esc to dismiss"));
     }
 
     #[test]
