@@ -65,6 +65,7 @@ The complete `/u` → Tab → username → Tab → send flow is covered end to e
 | Command | Effect |
 | --- | --- |
 | `/users` | Print known peers in the chat panel |
+| `/users <name>` | Open the direct-message tab for that user |
 | `/users <name> <body…>` | Send a direct message; body may be multiline |
 | `/file <path>` | Attach a file to the next direct message (use `Tab` to complete the path) |
 | `/attach <path>` | Alias for `/file <path>` |
