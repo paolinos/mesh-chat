@@ -1,4 +1,4 @@
-use tui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
 use super::app::App;
 
@@ -100,7 +100,7 @@ fn group_values(app: &App) -> Vec<(String, String)> {
 /// Work out what the caret is currently typing. Only the first input line can hold a command;
 /// later lines are the (free-form) message body.
 pub fn find_completion(app: &App) -> Option<Completion> {
-    let (row, col) = app.textarea.cursor();
+    let DataCursor(row, col) = app.textarea.cursor();
     if row != 0 {
         return None;
     }
@@ -151,7 +151,7 @@ pub fn apply_candidate(
     completion: &Completion,
     candidate: &Candidate,
 ) {
-    let (row, col) = textarea.cursor();
+    let DataCursor(row, col) = textarea.cursor();
     let prefix_len = completion.prefix.chars().count();
     if col < prefix_len {
         return;

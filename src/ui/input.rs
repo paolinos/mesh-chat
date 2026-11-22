@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use tui_textarea::Input;
+use ratatui_textarea::Input;
 
 use super::app::{App, Selection};
 use super::complete::{unique_prefix, COMMANDS, GROUP_SUBCOMMANDS};
@@ -176,7 +176,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
             // Editing always means the user is talking to the input, not the channel list.
             app.selection = Selection::None;
             app.textarea.input(Input {
-                key: tui_textarea::Key::Enter,
+                key: ratatui_textarea::Key::Enter,
                 ctrl: false,
                 alt: false,
                 shift: true,

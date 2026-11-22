@@ -173,7 +173,7 @@ pub struct App<'a> {
     pub selection: Selection,
     pub channel_selection: usize,
     pub group_selection: usize,
-    pub textarea: tui_textarea::TextArea<'a>,
+    pub textarea: ratatui_textarea::TextArea<'a>,
     /// Conversations with messages that arrived while they were not open.
     unread: HashSet<String>,
     /// Suggestions for the token under the caret, shown in the input panel.
@@ -187,7 +187,7 @@ pub struct App<'a> {
 
 impl<'a> App<'a> {
     pub fn new(me: PeerId, username: String) -> App<'static> {
-        let mut textarea = tui_textarea::TextArea::default();
+        let mut textarea = ratatui_textarea::TextArea::default();
         textarea.set_placeholder_text("Type a message; Shift+Enter inserts a newline");
         let mut conversations = IndexMap::new();
         conversations.insert(GENERAL.to_string(), Vec::new());
@@ -731,7 +731,7 @@ impl<'a> App<'a> {
     }
 
     pub fn clear_textarea(&mut self) {
-        self.textarea = tui_textarea::TextArea::default();
+        self.textarea = ratatui_textarea::TextArea::default();
         self.textarea
             .set_placeholder_text("Type a message; Shift+Enter inserts a newline");
         self.completion = None;
