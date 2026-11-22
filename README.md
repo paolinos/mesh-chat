@@ -119,9 +119,31 @@ flowchart LR
   Worker --> DB[("chat.db")]
 ```
 
-`main.rs` wires three independent owners: the UI draws state, the worker is the only owner of the SQLite connection, and `network/` owns the swarm. The network task handles mDNS discovery, direct encrypted request/response for messages, invites and acknowledgements, and gossipsub only for presence. Every network event is mirrored to the worker and the UI, so presence can flush the outbox while the same event updates the chat panel.
+`main.rs` wires three independent owners: the UI draws state, the worker is the only owner of the SQLite connection, and `network/` owns the swarm. The network task handles mDNS discovery, direct encrypted request/response for messages, invites and acknowledgements, and gossipsub only for presence.
 
-The outbox stores one row per (message, recipient), so group fan-out is acknowledged individually. Rows are only dequeued for peers currently online; delivery reports mark them done or apply backoff. This is what lets offline messages survive restarts.
+### How a message flows
+
+**Sending a message or file**
+
+1. The user presses `Enter` in the UI.
+2. The UI asks the **worker** to save the outgoing message. For files, the worker reads the source file and stores attachment metadata.
+3. The worker writes one `messages` row and one `outbox` row per recipient in a single SQLite transaction.
+4. The worker polls the outbox every ~500 ms. Due rows for online peers are claimed and handed to the **network** layer as encrypted direct requests.
+5. The network layer sends each request over a Noise-encrypted libp2p connection and waits for an ACK.
+6. The network reports the result back to the worker, which marks the outbox row `done` or schedules a retry with exponential backoff.
+7. The UI shows `(Pending)` while any recipient has an undelivered outbox row.
+
+**Receiving a message or file**
+
+1. The **network** layer receives an encrypted direct request from a peer.
+2. The network emits a `MessageReceived` event. It is mirrored to both the **worker** and the **UI**.
+3. The UI renders the message immediately so the user sees it without waiting for disk I/O.
+4. The worker stores the message in `chat.db`. For files, it also writes the bytes to `data/downloads/` and then tells the UI the final local path.
+5. If the conversation was not open, the worker writes an unread marker; the UI shows a yellow `●` on the channel/group label.
+
+### Offline resilience
+
+The outbox stores one row per (message, recipient), so group fan-out is acknowledged individually. Rows are only dequeued for peers currently online; delivery reports mark them done or apply backoff. When a peer comes back online, a presence event wakes the worker and pending rows for that peer are flushed automatically. This is what lets offline messages and file attachments survive restarts.
 
 ### Folder structure
 
